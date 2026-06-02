@@ -1,11 +1,13 @@
-# NexusTrade — AI Trading Harness
+# Nexus Trader — AI Trading Harness
 
 > **Status:** Research & Prototyping Phase  
 > **Goal:** Make LumiBot the universal AI trading harness — plug any model in, give it tools, data, and memory, and it becomes an autonomous trader.
 
+**If you are an AI agent, read AGENTS.md first for operational instructions and EXECUTION_ROADMAP.md for the current execution plan.**
+
 ## What This Is
 
-NexusTrade is an AI-native trading system built on top of **LumiBot v4.5.25** that turns any LLM into a trading agent with:
+Nexus Trader is an AI-native trading system built on top of **LumiBot v4.5.25** that turns any LLM into a trading agent with:
 - Full market data access (real-time, historical, fundamentals, macro)
 - Institutional-grade backtest safety (no future data leakage)
 - Persistent memory and thesis lifecycle management
@@ -16,7 +18,7 @@ NexusTrade is an AI-native trading system built on top of **LumiBot v4.5.25** th
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                   NEXUSTRADE LAYER                     │
+│                   NEXISAI LAYER                        │
 │  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐ │
 │  │ Custom Tools │  │ Memory Bridge │  │    Models    │ │
 │  │ (regime,     │  │ (LumiBot →    │  │ GLM-5, DS-V4,│ │

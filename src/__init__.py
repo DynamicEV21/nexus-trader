@@ -1,1 +1,1 @@
-"""NexusTrade — Multi-agent investment platform with persistent vector memory."""
+"""Nexus Trader — Multi-agent investment platform with persistent vector memory."""

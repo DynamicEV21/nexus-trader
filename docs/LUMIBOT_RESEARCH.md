@@ -523,9 +523,9 @@ LumiBot agents use **flexible Python code** for orchestration:
 
 ---
 
-## 9. Summary for Nexus Trade
+## 9. Summary for Nexus Trader
 
-### What LumiBot Provides That Nexus Trade Could Leverage
+### What LumiBot Provides That Nexus Trader Could Leverage
 
 1. **Proven agent-in-backtest-loop pattern** — unique in the market
 2. **Replay caching** — solves LLM cost/determinism issues

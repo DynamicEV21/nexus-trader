@@ -1,0 +1,6 @@
+# Nexus Trader — AI Agent Instructions
+Read AGENTS.md first. It contains all operational procedures, model configurations, known issues, and correct ways to run backtests.
+Then read docs/EXECUTION_ROADMAP.md for the current execution plan (Phases 0-12).
+Project directory: /home/Zev/development/nexus-trade/
+LumiBot install: /home/Zev/development/trading-bots/lumibot/ (use .venv/bin/python)
+Environment: load .env from LumiBot dir, set LUMIBOT_CACHE_FOLDER=/tmp/lumibot_cache

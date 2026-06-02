@@ -1,9 +1,9 @@
 """
-NexusTrade Vector Memory — LanceDB-backed persistent trade memory
+Nexus Trader Vector Memory — LanceDB-backed persistent trade memory
 ==================================================================
 
 Wraps and extends the ``VectorMemory`` from agentic-quant-os to provide
-NexusTrade-specific schemas for trade decisions and lessons.
+Nexus Trader-specific schemas for trade decisions and lessons.
 
 Key design principles
 ---------------------
@@ -56,7 +56,7 @@ EMBEDDING_DIM: int = 3072  # gemini-embedding-001 output dimensionality
 
 
 class NexusDecisionRecord(LanceModel):
-    """LanceDB row schema for a NexusTrade trade decision."""
+    """LanceDB row schema for a Nexus Trader trade decision."""
 
     id: str = Field(description="Unique key: decision_{timestamp}_{symbol}")
     vector: Vector(EMBEDDING_DIM) = Field(description="Gemini embedding of decision DNA")  # type: ignore[valid-type]
@@ -69,7 +69,7 @@ class NexusDecisionRecord(LanceModel):
     outcome: str = Field(description="win, loss, or pending")
     pnl_pct: float = 0.0
     timestamp: str
-    strategy_name: str = "NexusTrade"
+    strategy_name: str = "Nexus_Trader"
     backtest_id: str = ""
 
 
@@ -85,7 +85,7 @@ class NexusLessonRecord(LanceModel):
     severity: str = Field(description="info, warning, or critical")
     tags_json: str = Field(description="JSON list of tags")
     timestamp: str
-    strategy_name: str = "NexusTrade"
+    strategy_name: str = "Nexus_Trader"
     source: str = Field(description="Origin: committee, backtest, manual, bridge")
 
 
@@ -108,7 +108,7 @@ _BASE_BACKOFF_SECONDS: float = 1.0
 
 
 class NexusVectorMemory:
-    """NexusTrade-specific vector memory backed by LanceDB + Gemini embeddings.
+    """Nexus Trader-specific vector memory backed by LanceDB + Gemini embeddings.
 
     Uses the same LanceDB directory as agentic-quant-os but with
     dedicated table names ``nexus_decisions`` and ``nexus_lessons``.
@@ -354,7 +354,7 @@ class NexusVectorMemory:
         thesis = decision.get("thesis_summary", "")[:200]
         outcome = decision.get("outcome", "pending")
         pnl = decision.get("pnl_pct", 0.0)
-        strategy = decision.get("strategy_name", "NexusTrade")
+        strategy = decision.get("strategy_name", "Nexus_Trader")
 
         return (
             f"[{symbol}] {action} in {regime} regime | "
@@ -418,7 +418,7 @@ class NexusVectorMemory:
                 outcome=decision.get("outcome", "pending"),
                 pnl_pct=float(decision.get("pnl_pct", 0.0)),
                 timestamp=decision.get("timestamp", ""),
-                strategy_name=decision.get("strategy_name", "NexusTrade"),
+                strategy_name=decision.get("strategy_name", "Nexus_Trader"),
                 backtest_id=decision.get("backtest_id", ""),
             )
 
@@ -556,7 +556,7 @@ class NexusVectorMemory:
                             outcome=dec.get("outcome", "pending"),
                             pnl_pct=float(dec.get("pnl_pct", 0.0)),
                             timestamp=dec.get("timestamp", ""),
-                            strategy_name=dec.get("strategy_name", "NexusTrade"),
+                            strategy_name=dec.get("strategy_name", "Nexus_Trader"),
                             backtest_id=dec.get("backtest_id", ""),
                         )
                         records_to_add.append(record.model_dump())
@@ -705,7 +705,7 @@ class NexusVectorMemory:
                 severity=lesson.get("severity", "info"),
                 tags_json=tags_json,
                 timestamp=lesson.get("timestamp", ""),
-                strategy_name=lesson.get("strategy_name", "NexusTrade"),
+                strategy_name=lesson.get("strategy_name", "Nexus_Trader"),
                 source=lesson.get("source", ""),
             )
 

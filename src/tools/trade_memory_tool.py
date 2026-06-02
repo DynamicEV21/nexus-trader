@@ -2,7 +2,7 @@
 Trade Memory Tool — LumiBot @agent_tool for semantic memory search
 ===================================================================
 
-Provides AI agents with the ability to query the NexusTrade vector
+Provides AI agents with the ability to query the Nexus Trader vector
 memory for similar past decisions, relevant lessons, and historical
 context.  This allows the investment committee to learn from history.
 
@@ -162,7 +162,7 @@ def remember_decision_tool(
             "outcome": "pending",
             "pnl_pct": 0.0,
             "timestamp": timestamp,
-            "strategy_name": "NexusTrade",
+            "strategy_name": "Nexus_Trader",
             "backtest_id": backtest_id,
         }
 
@@ -234,7 +234,7 @@ def remember_lesson_tool(
             "severity": severity,
             "tags": tags_list,
             "timestamp": timestamp,
-            "strategy_name": "NexusTrade",
+            "strategy_name": "Nexus_Trader",
             "source": "committee",
         }
 
@@ -248,7 +248,7 @@ def remember_lesson_tool(
 
 
 def get_memory_stats_tool(self) -> dict[str, Any]:
-    """Get statistics about the NexusTrade vector memory bank.
+    """Get statistics about the Nexus Trader vector memory bank.
 
     Returns counts of stored decisions and lessons, and whether the
     memory system is operational.

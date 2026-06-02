@@ -1,5 +1,5 @@
 """
-NexusTrade Investment Committee — Multi-Agent Strategy with Vector Memory
+Nexus Trader Investment Committee — Multi-Agent Strategy with Vector Memory
 ==========================================================================
 
 A multi-agent investment committee strategy for LumiBot that combines:
@@ -49,7 +49,7 @@ Requirements
 ------------
 * LumiBot with agent support (``strategy.agents``)
 * CrabQuant (importable, for regime detection)
-* NexusTrade memory package (importable, for vector memory)
+* Nexus Trader memory package (importable, for vector memory)
 * ``GOOGLE_API_KEY`` for vector embeddings
 """
 
@@ -61,7 +61,7 @@ import sys
 from datetime import datetime
 from typing import Any
 
-# Ensure NexusTrade src is importable
+# Ensure Nexus Trader src is importable
 _SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
@@ -196,7 +196,7 @@ class NexusCommitteeStrategy(Strategy):
         try:
             from src.memory.bridge import MemoryBridge
 
-            bridge = MemoryBridge(strategy_name="NexusTrade")
+            bridge = MemoryBridge(strategy_name="Nexus_Trader")
             stats = bridge.sync_all()
             total = sum(stats.get(k, {}).get("embedded", 0) for k in ("decisions", "lessons", "theses", "memories"))
             if total > 0:

@@ -1,218 +1,226 @@
-# AGENTS.md - Your Workspace
+# AGENTS.md — Nexus Trader Agent Operations Guide
 
-This folder is home. Treat it that way.
+> **Purpose:** When a new agent instance starts working on this project, read this file first. It contains critical operational knowledge, gotchas, and correct procedures that took significant investigation to discover. Do NOT re-derive these from scratch.
 
-## First Run
+---
 
-If `BOOTSTRAP.md` exists, that's your birth certificate. Follow it, figure out who you are, then delete it. You won't need it again.
+## Project Overview
 
-## Session Startup
+**Nexus Trader** is an AI-native trading system built on LumiBot v4.5.25+. It turns LLMs into autonomous trading agents with tools, memory, and backtesting support.
 
-Use runtime-provided startup context first.
+- **Project directory:** `/home/Zev/development/nexus-trade/`
+- **LumiBot install:** `/home/Zev/development/trading-bots/lumibot/` (venv at `.venv/bin/python`)
+- **LumiBot .env:** `/home/Zev/development/trading-bots/lumibot/.env`
+- **Cache dir:** `/tmp/lumibot_cache/` (set via `LUMIBOT_CACHE_FOLDER` env var)
+- **Replay cache:** `/tmp/lumibot_cache/agent_runtime/replay/`
+- **Traces:** `/tmp/lumibot_cache/agent_runtime/traces/<agent_name>/`
+- **Summaries:** `/tmp/lumibot_cache/agent_runtime/agent_run_summaries.jsonl`
+- **Memory JSONL:** `/home/Zev/development/trading-bots/lumibot/.lumibot/memory/<strategy_name>/`
+- **Data:** `~/development/quant-projects/financial-data/stocks/sp500_daily/` (503 S&P tickers, 5yr daily)
 
-That context may already include:
+---
 
-- `AGENTS.md`, `SOUL.md`, and `USER.md`
-- recent daily memory such as `memory/YYYY-MM-DD.md`
-- `MEMORY.md` when this is the main session
+## Agent Responsibilities
 
-Do not manually reread startup files unless:
+Every agent working on this project MUST:
 
-1. The user explicitly asks
-2. The provided context is missing something you need
-3. You need a deeper follow-up read beyond the provided startup context
+1. **Update MEMORY.md** when you discover new operational knowledge, gotchas, configuration changes, or environment quirks.
+2. **Update AGENTS.md** when you find procedures that future agents will need (model configs, correct CLI invocations, known failure modes).
+3. **After any test or investigation**, check whether findings belong in `MEMORY.md` or `docs/EXECUTION_ROADMAP.md` (progress, test results, phase status) — not here.
+4. **Keep AGENTS.md focused** on "how to operate this project." Test results, benchmarks, and phase progress go in `docs/EXECUTION_ROADMAP.md`.
 
-## Memory
+---
 
-You wake up fresh each session. These files are your continuity:
+## Key Architecture Concepts
 
-- **Daily notes:** `memory/YYYY-MM-DD.md` (create `memory/` if needed) — raw logs of what happened
-- **Long-term:** `MEMORY.md` — your curated memories, like a human's long-term memory
+### Two Caching Layers
 
-Capture what matters. Decisions, context, things to remember. Skip the secrets unless asked to keep them.
+1. **LumiBot Replay Cache** (local disk, any model)
+   - SHA-256 hash of: system_prompt + task_prompt + runtime_context (datetime, positions, cash, orders, trades) + model + tool definitions + memory_notes
+   - Stored as gzip JSON at `/tmp/lumibot_cache/agent_runtime/replay/`
+   - Enables instant re-runs of identical backtests (~500x speedup)
+   - Works with ANY model (GLM-5, Gemini, etc.)
 
-### 🧠 MEMORY.md - Your Long-Term Memory
+2. **Provider Prompt Cache** (remote, model-specific)
+   - Google's Gemini or OpenAI's server-side caching
+   - ~20-40% cost discount on repeated prefixes
+   - Only works with that provider's own models
+   - GLM-5 does NOT get provider prompt caching on any endpoint
 
-- **ONLY load in main session** (direct chats with your human)
-- **DO NOT load in shared contexts** (Discord, group chats, sessions with other people)
-- This is for **security** — contains personal context that shouldn't leak to strangers
-- You can **read, edit, and update** MEMORY.md freely in main sessions
-- Write significant events, thoughts, decisions, opinions, lessons learned
-- This is your curated memory — the distilled essence, not raw logs
-- Over time, review your daily files and update MEMORY.md with what's worth keeping
+### Sleeptime Controls Agent Frequency
 
-### 📝 Write It Down - No "Mental Notes"!
+- `sleeptime = "1D"` → agent wakes once per trading day (~126 iterations per 6-month backtest)
+- `sleeptime = "5min"` → agent wakes every 5 minutes (~75,000 iterations per 6-month backtest)
+- The agent can load 5-minute bars at any sleeptime frequency via `market_load_history_table(timestep='5min')` with `WHERE datetime <= cutoff` in DuckDB
+- **Use daily sleeptime for initial testing** — saves tokens and prevents context overflow
 
-- **Memory is limited** — if you want to remember something, WRITE IT TO A FILE
-- "Mental notes" don't survive session restarts. Files do.
-- When someone says "remember this" → update `memory/YYYY-MM-DD.md` or relevant file
-- When you learn a lesson → update AGENTS.md, TOOLS.md, or the relevant skill
-- When you make a mistake → document it so future-you doesn't repeat it
-- **Text > Brain** 📝
+### DuckDB Time Wall (Future Data Protection)
 
-## Red Lines
+- DuckDB creates a "visible" view with `WHERE datetime <= cutoff` (the current backtest datetime)
+- This prevents the agent from seeing future price data in DuckDB queries
+- **WARNING:** This only protects DuckDB data. Internet-connected tools (web search, news, FRED API) may NOT have time filtering. Must test for lookahead bias separately (see Roadmap Phase 0 test).
 
-- Don't exfiltrate private data. Ever.
-- Don't run destructive commands without asking.
-- `trash` > `rm` (recoverable beats gone forever)
-- When in doubt, ask.
+### Memory Notes Grow Per Iteration
 
-## External vs Internal
+- Each iteration's result is appended to `memory_notes` via `_append_memory()`
+- Memory notes are included in the cache key hash
+- This means iteration N always has more notes than iteration N-1 (different hash)
+- Cache only works for re-running ENTIRE backtests from scratch (notes reset on new instantiation)
+- Memory is capped at 20 most recent notes, with configurable char limit (`LUMIBOT_AGENT_MEMORY_NOTE_MAX_CHARS`, default 2000)
 
-**Safe to do freely:**
+---
 
-- Read files, explore, organize, learn
-- Search the web, check calendars
-- Work within this workspace
+## Correct Procedures
 
-**Ask first:**
+### Running a Backtest
 
-- Sending emails, tweets, public posts
-- Anything that leaves the machine
-- Anything you're uncertain about
+```python
+from datetime import datetime
+from lumibot.strategies import Strategy
+from lumibot.backtesting import YahooDataBacktesting
+from lumibot.entities import Asset, TradingFee
 
-## Group Chats
+class MyStrategy(Strategy):
+    def initialize(self):
+        self.sleeptime = "1D"
+        self.agents.create(
+            name="trader",
+            model="openai/glm-5-turbo",
+            allow_trading=True,
+            system_prompt="Your trading instructions here.",
+        )
 
-You have access to your human's stuff. That doesn't mean you _share_ their stuff. In groups, you're a participant — not their voice, not their proxy. Think before you speak.
+    def on_trading_iteration(self):
+        now = self.get_datetime()
+        self.agents["trader"].run(
+            task_prompt=f"Current datetime: {now.isoformat()}. Analyze and trade.",
+        )
 
-### 💬 Know When to Speak!
-
-In group chats where you receive every message, be **smart about when to contribute**:
-
-**Respond when:**
-
-- Directly mentioned or asked a question
-- You can add genuine value (info, insight, help)
-- Something witty/funny fits naturally
-- Correcting important misinformation
-- Summarizing when asked
-
-**Stay silent when:**
-
-- It's just casual banter between humans
-- Someone already answered the question
-- Your response would just be "yeah" or "nice"
-- The conversation is flowing fine without you
-- Adding a message would interrupt the vibe
-
-**The human rule:** Humans in group chats don't respond to every single message. Neither should you. Quality > quantity. If you wouldn't send it in a real group chat with friends, don't send it.
-
-**Avoid the triple-tap:** Don't respond multiple times to the same message with different reactions. One thoughtful response beats three fragments.
-
-Participate, don't dominate.
-
-### 😊 React Like a Human!
-
-On platforms that support reactions (Discord, Slack), use emoji reactions naturally:
-
-**React when:**
-
-- You appreciate something but don't need to reply (👍, ❤️, 🙌)
-- Something made you laugh (😂, 💀)
-- You find it interesting or thought-provoking (🤔, 💡)
-- You want to acknowledge without interrupting the flow
-- It's a simple yes/no or approval situation (✅, 👀)
-
-**Why it matters:**
-Reactions are lightweight social signals. Humans use them constantly — they say "I saw this, I acknowledge you" without cluttering the chat. You should too.
-
-**Don't overdo it:** One reaction per message max. Pick the one that fits best.
-
-## Tools
-
-Skills provide your tools. When you need one, check its `SKILL.md`. Keep local notes (camera names, SSH details, voice preferences) in `TOOLS.md`.
-
-**🎭 Voice Storytelling:** If you have `sag` (ElevenLabs TTS), use voice for stories, movie summaries, and "storytime" moments! Way more engaging than walls of text. Surprise people with funny voices.
-
-**📝 Platform Formatting:**
-
-- **Discord/WhatsApp:** No markdown tables! Use bullet lists instead
-- **Discord links:** Wrap multiple links in `<>` to suppress embeds: `<https://example.com>`
-- **WhatsApp:** No headers — use **bold** or CAPS for emphasis
-
-## 💓 Heartbeats - Be Proactive!
-
-When you receive a heartbeat poll (message matches the configured heartbeat prompt), don't just reply `HEARTBEAT_OK` every time. Use heartbeats productively!
-
-You are free to edit `HEARTBEAT.md` with a short checklist or reminders. Keep it small to limit token burn.
-
-### Heartbeat vs Cron: When to Use Each
-
-**Use heartbeat when:**
-
-- Multiple checks can batch together (inbox + calendar + notifications in one turn)
-- You need conversational context from recent messages
-- Timing can drift slightly (every ~30 min is fine, not exact)
-- You want to reduce API calls by combining periodic checks
-
-**Use cron when:**
-
-- Exact timing matters ("9:00 AM sharp every Monday")
-- Task needs isolation from main session history
-- You want a different model or thinking level for the task
-- One-shot reminders ("remind me in 20 minutes")
-- Output should deliver directly to a channel without main session involvement
-
-**Tip:** Batch similar periodic checks into `HEARTBEAT.md` instead of creating multiple cron jobs. Use cron for precise schedules and standalone tasks.
-
-**Things to check (rotate through these, 2-4 times per day):**
-
-- **Emails** - Any urgent unread messages?
-- **Calendar** - Upcoming events in next 24-48h?
-- **Mentions** - Twitter/social notifications?
-- **Weather** - Relevant if your human might go out?
-
-**Track your checks** in `memory/heartbeat-state.json`:
-
-```json
-{
-  "lastChecks": {
-    "email": 1703275200,
-    "calendar": 1703260800,
-    "weather": null
-  }
-}
+result = MyStrategy.backtest(
+    YahooDataBacktesting,
+    backtesting_start=datetime(2025, 1, 1),
+    backtesting_end=datetime(2025, 3, 31),
+    benchmark_asset=Asset("SPY"),
+    buy_trading_fees=[TradingFee(percent_fee=0.001)],
+    sell_trading_fees=[TradingFee(percent_fee=0.001)],
+    quote_asset=Asset("USD", Asset.AssetType.FOREX),
+    budget=10000,
+    name="my_strategy_v1",  # MUST be consistent for replay cache
+)
 ```
 
-**When to reach out:**
+### Replay Cache Rules
 
-- Important email arrived
-- Calendar event coming up (&lt;2h)
-- Something interesting you found
-- It's been >8h since you said anything
+- **CRITICAL:** The `name=` parameter MUST be identical between runs for cache to work
+- `name` feeds into `runtime_context["strategy_name"]` which is part of the SHA-256 cache key hash
+- Different names = different hashes = cache miss every time
+- After the first live run, subsequent identical runs should complete in <1 second for a 10-day backtest
 
-**When to stay quiet (HEARTBEAT_OK):**
+### Model Configuration
 
-- Late night (23:00-08:00) unless urgent
-- Human is clearly busy
-- Nothing new since last check
-- You just checked &lt;30 minutes ago
+| Model | Prefix | Base URL | Notes |
+|---|---|---|---|
+| GLM-5 Turbo | `openai/glm-5-turbo` | `https://api.z.ai/api/coding/paas/v4` | Current default, good tool calling |
+| GLM-5 Turbo (general) | `openai/glm-5-turbo` | `https://api.z.ai/api/paas/v4` | May be better for trading agents |
+| Gemini 3 Flash | `openai/gemini-3-flash-preview` | `https://ollama.com/v1` | Via Ollama Cloud, requires `openai/` prefix |
 
-**Proactive work you can do without asking:**
+**z.ai has TWO endpoints:**
+- **Coding:** `https://api.z.ai/api/coding/paas/v4` — optimized for code generation tools
+- **General:** `https://api.z.ai/api/paas/v4` — standard LLM API, may be better for trading agents
 
-- Read and organize memory files
-- Check on projects (git status, etc.)
-- Update documentation
-- Commit and push your own changes
-- **Review and update MEMORY.md** (see below)
+### Environment Setup
 
-### 🔄 Memory Maintenance (During Heartbeats)
+Before running any LumiBot code:
+```bash
+cd /home/Zev/development/trading-bots/lumibot
+source .venv/bin/activate
+export LUMIBOT_CACHE_FOLDER=/tmp/lumibot_cache
+```
 
-Periodically (every few days), use a heartbeat to:
+Or in Python:
+```python
+import sys, os
+sys.path.insert(0, "/home/Zev/development/trading-bots/lumibot")
+from dotenv import load_dotenv
+load_dotenv("/home/Zev/development/trading-bots/lumibot/.env")
+os.environ.setdefault("LUMIBOT_CACHE_FOLDER", "/tmp/lumibot_cache")
+```
 
-1. Read through recent `memory/YYYY-MM-DD.md` files
-2. Identify significant events, lessons, or insights worth keeping long-term
-3. Update `MEMORY.md` with distilled learnings
-4. Remove outdated info from MEMORY.md that's no longer relevant
+---
 
-Think of it like a human reviewing their journal and updating their mental model. Daily files are raw notes; MEMORY.md is curated wisdom.
+## Known Issues & Gotchas
 
-The goal: Be helpful without being annoying. Check in a few times a day, do useful background work, but respect quiet time.
+### Context Window Overflow
+- GLM-5 context grows ~100K+ tokens per iteration due to accumulated tool results and memory notes
+- Backtests >2 months at daily frequency will likely overflow
+- **Fix:** Use 1-2 month windows, or reduce tool calls per iteration
+- Thinking tokens add 2-5K per iteration for reasoning models — not the main issue
 
-## Make It Yours
+### Limit Order Chasing Problem
+- The agent tends to place limit orders well below current price
+- When price moves up, the limit doesn't fill
+- Agent cancels and places new limit at higher price, repeating daily
+- **Fix:** Use market orders for initial entries, or set tighter limit spreads in prompt
 
-This is a starting point. Add your own conventions, style, and rules as you figure out what works.
+### Agent Over-Conservatism
+- Default LumiBot system prompt is very conservative ("do not trade for the sake of activity")
+- With daily sleeptime, the agent sees only daily bars → less conviction → more HOLD CASH
+- **Fix:** Override default behavior in your system prompt, or use intraday data for more signals
 
-## Related
+### LiteLLM Provider Prefix
+- All models go through LiteLLM with `openai/` prefix
+- Gemini Flash via Ollama Cloud: model = `openai/gemini-3-flash-preview` (NOT `ollama-cloud/`)
+- LiteLLM doesn't recognize `ollama-cloud/` provider prefix
 
-- [Default AGENTS.md](/reference/AGENTS.default)
+---
+
+## Available Tools (40+ built-in)
+
+LumiBot agents have access to these tool categories:
+
+| Category | Tools | Status in Nexus Trader |
+|---|---|---|
+| Account | positions, portfolio, cash | ✅ Used |
+| Market | last_price, load_history, load_history_table | ✅ Used |
+| DuckDB | query (direct SQL on price data) | ✅ Used |
+| Indicators | get_indicators, get_indicator, signal_dashboard | ✅ Used |
+| Orders | submit_order, cancel_order, open_orders | ✅ Used |
+| FRED Macro | fred_snapshot, fred_latest | ⚠️ Available but untested for time filtering |
+| SEC/Fundamentals | sec_filings, company_info | ⚠️ Available but untested for time filtering |
+| News | alpaca_news (requires Alpaca keys) | ❌ Not configured |
+| Memory/Thesis | remember_decision, remember_lesson, remember_thesis, query_theses | ⚠️ Partially used |
+| Notifications | notify (email/webhook) | ❌ Not configured |
+| Docs | query_docs, search_docs | ⚠️ Available |
+
+---
+
+## Key Source Files in LumiBot
+
+| File | Purpose | Key Lines |
+|---|---|---|
+| `components/agents/replay_cache.py` | Cache key hashing, load/save | `compute_key()` at L58 |
+| `components/agents/manager.py` | Agent orchestration, cache integration | `_cache_payload()` at L875, `run()` at L1158, `_runtime_context()` at L609 |
+| `components/agents/runtime.py` | ADK runner, LLM calls | `_run_async()` at L718, thinking planner |
+| `components/agents/duckdb_tools.py` | DuckDB time wall | `_create_visible_view()` at L169 |
+| `components/agents/schemas.py` | Data schemas (RuntimeRequest, etc.) | Full file |
+
+---
+
+## Documentation Structure
+
+| File | Purpose |
+|---|---|
+| `docs/EXECUTION_ROADMAP.md` | Master execution plan (Phases 0-12) — START HERE |
+| `docs/PRD.md` | Product requirements document |
+| `docs/ROADMAP_legacy.md` | Original roadmap (superseded by EXECUTION_ROADMAP) |
+| `docs/NEXUS_TRADER_ROADMAP.md` | Older project roadmap reference |
+| `docs/BRAINSTORM_CHATLOG.md` | Raw brainstorm conversation with all feature ideas |
+| `docs/INTEGRATION_MAP.md` | Integration map for 8 quant repos |
+| `docs/AUDIT_REPORT.md` | Tool and feature audit |
+| `docs/MODEL_GUIDE.md` | Model selection guide |
+| `docs/TOOL_CALLING_BENCHMARKS.md` | Tool calling benchmarks |
+| `docs/LUMIBOT_RESEARCH.md` | Deep research on LumiBot internals |
+| `docs/research_*.md` | Financial data, backtesting, agent systems research |
+| `src/strategies/nexus_committee.py` | 4-agent committee strategy |
+| `src/memory/` | Vector memory bridge + LanceDB storage |
+| `src/tools/` | Custom tools (trade_memory_tool) |

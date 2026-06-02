@@ -1,1 +1,1 @@
-"""NexusTrade trading strategies."""
+"""Nexus Trader trading strategies."""

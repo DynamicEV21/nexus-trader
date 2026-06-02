@@ -1,19 +1,19 @@
 """
-Memory Bridge — LumiBot JSONL ↔ NexusTrade Vector Memory
+Memory Bridge — LumiBot JSONL ↔ Nexus Trader Vector Memory
 ==========================================================
 
 Parses LumiBot's JSONL memory files (decisions.jsonl, lessons.jsonl,
-theses.jsonl, memories.jsonl) and bridges them into the NexusTrade
+theses.jsonl, memories.jsonl) and bridges them into the Nexus Trader
 LanceDB vector store for semantic search.
 
 Usage
 -----
-    python -m nexus_trade.memory.bridge [--strategy NexusTrade] [--dry-run]
+    python -m nexus_trade.memory.bridge [--strategy Nexus_Trader] [--dry-run]
 
 Or programmatically:
 
     from nexus_trade.memory.bridge import MemoryBridge
-    bridge = MemoryBridge("NexusTrade")
+    bridge = MemoryBridge("Nexus_Trader")
     stats = bridge.sync_all()
 
 Key design principles
@@ -48,7 +48,7 @@ _DEFAULT_MEMORY_DIR: str = os.environ.get(
 
 
 class MemoryBridge:
-    """Bridges LumiBot JSONL memory files to NexusTrade vector memory.
+    """Bridges LumiBot JSONL memory files to Nexus Trader vector memory.
 
     Parameters
     ----------
@@ -63,7 +63,7 @@ class MemoryBridge:
 
     def __init__(
         self,
-        strategy_name: str = "NexusTrade",
+        strategy_name: str = "Nexus_Trader",
         memory_dir: str | None = None,
         nexus_memory: NexusVectorMemory | None = None,
     ) -> None:
@@ -440,11 +440,11 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Bridge LumiBot JSONL memory to NexusTrade vector memory",
+        description="Bridge LumiBot JSONL memory to Nexus Trader vector memory",
     )
     parser.add_argument(
         "--strategy", "-s",
-        default="NexusTrade",
+        default="Nexus_Trader",
         help="Strategy name (subdirectory under .lumibot/memory/)",
     )
     parser.add_argument(

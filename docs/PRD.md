@@ -1,4 +1,4 @@
-# NexusTrade — Product Requirements Document
+# Nexus Trader — Product Requirements Document
 
 > **Version:** 0.1 (Research Phase)  
 > **Last Updated:** 2026-05-31  
@@ -8,7 +8,7 @@
 
 ## 1. Vision Statement
 
-**NexusTrade turns LumiBot into the universal AI trading harness.**
+**Nexus Trader turns LumiBot into the universal AI trading harness.**
 
 Plug any LLM in, give it market data tools, custom quant tools, persistent memory, and it becomes an autonomous trader. The AI's reasoning IS the strategy — no hardcoded rules, no fixed indicators. The system learns from its own decisions and compounds knowledge over time.
 
@@ -137,24 +137,24 @@ AI starts with accumulated knowledge
 
 ## 4. Integration Map (Existing Projects)
 
-### 4.1 quant-loop-testnet → NexusTrade
+### 4.1 quant-loop-testnet → Nexus Trader
 - **Strategy Genome DB**: Store all AI trading decisions, theses, and outcomes
 - **Regime detector**: Feed regime classification into AI's context
 - **Strategy factory**: AI-generated strategies get validated in arena harness
 - **Daily brief**: Feed AI with genome DB insights before trading
 
-### 4.2 CrabQuant → NexusTrade
+### 4.2 CrabQuant → Nexus Trader
 - **Arena harness**: Backtest validation for AI-created strategies
 - **Guardrails system**: Overfitting detection, risk checks
 - **Vectorized backtest**: Fast parameter sweeps for signal optimization
 - **Walk-forward validation**: Before any live deployment
 
-### 4.3 strat-depot → NexusTrade
+### 4.3 strat-depot → Nexus Trader
 - **7,000+ strategies**: Source material for AI to study and adapt
 - **RSI-Centered-Pivots**: The one verified strategy — baseline comparison
 - **Strategy classifier**: Auto-score strategies for the AI
 
-### 4.4 agentic-quant-os → NexusTrade
+### 4.4 agentic-quant-os → Nexus Trader
 - **Master vision**: Architecture reference and phased roadmap alignment
 - **Agent topology**: Research → Validation → Portfolio → Risk → Execution
 - **Memory stack**: Qdrant for vector memory integration

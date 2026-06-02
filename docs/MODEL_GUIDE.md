@@ -1,4 +1,4 @@
-# NexusTrade Model Selection Guide
+# Nexus Trader Model Selection Guide
 
 > **Version:** 0.1 (Initial Research)  
 > **Last Updated:** 2026-05-31  
@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-This guide recommends model assignments for NexusTrade's multi-agent trading system based on:
+This guide recommends model assignments for Nexus Trader's multi-agent trading system based on:
 1. **Existing model knowledge** from strat-depot research and AI trading landscape analysis
 2. **LumiBot tool-calling context** from Wave 0 audit
 3. **Model characteristics** from Ollama Cloud availability
@@ -44,7 +44,7 @@ Their work suggests **different models for different roles**:
 - Emphasizes **Trading-as-Git** versioning and approval gates
 - Multi-broker unified trading account (UTA)
 
-Key insight: **Claude models are production-proven for agentic trading**, but NexusTrade uses Ollama Cloud (different provider set).
+Key insight: **Claude models are production-proven for agentic trading**, but Nexus Trader uses Ollama Cloud (different provider set).
 
 #### LumiBot Agent Architecture (from Wave 0 Audit)
 
@@ -306,7 +306,7 @@ The Genome DB (in `quant-loop-testnet/conveyor/genome_db.py`) stores:
 - Performance by regime (bull/bear/sideways/high-vol/low-vol)
 - Parameter success patterns
 
-**For NexusTrade:** Use Genome DB to:
+**For Nexus Trader:** Use Genome DB to:
 1. **Inform Researcher Agent** — "In similar regimes, these strategies worked..."
 2. **Track AI strategy performance** — Store AI-generated theses + outcomes
 3. **Cross-validate** — Compare AI decisions to historical winners

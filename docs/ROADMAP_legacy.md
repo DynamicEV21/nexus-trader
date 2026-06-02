@@ -1,4 +1,4 @@
-# NexusTrade — Implementation Roadmap
+# Nexus Trader — Implementation Roadmap
 
 > **Version:** 0.1  
 > **Last Updated:** 2026-05-31  
@@ -13,7 +13,7 @@
 ### Completed
 - [x] Wave 0: Tool audit — all 21 built-in tools verified working
 - [x] GitHub/docs research — architecture, best practices, patterns understood
-- [x] Integration map — all 8 repos mapped to NexusTrade integration points
+- [x] Integration map — all 8 repos mapped to Nexus Trader integration points
 - [x] Model guide — preliminary model assignments drafted
 
 ### In Progress
