@@ -1,0 +1,448 @@
+"""
+Lakehouse Tools — LumiBot @agent_tool wrappers for the Nexus Trader committee.
+
+Each tool function takes ``self`` (the strategy instance) as its first
+argument and delegates to :class:`NexusLakehouseReader`.
+
+Follows the same pattern as ``src/tools/trade_memory_tool.py``:
+- ``try/except ImportError`` fallback for lumibot
+- Module-level constants for each registered tool
+- All tools catch exceptions internally — never crash the agent
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_reader():
+    """Lazily import the reader to avoid import-time side effects."""
+    from src.lakehouse.reader import get_reader
+    return get_reader()
+
+
+# ---------------------------------------------------------------------------
+# Tool functions  (each takes ``self`` — the strategy instance)
+# ---------------------------------------------------------------------------
+
+def lakehouse_regime(
+    self,
+    ticker: str = "SPY",
+) -> dict[str, Any]:
+    """Get the latest composite market regime for a ticker.
+
+    Returns the Regime Intelligence state (regime_label, confidence,
+    component scores, volatility regime, trend direction, etc.).
+
+    Args:
+        ticker: Stock/crypto ticker, e.g. 'SPY', 'BTC', 'AAPL'.
+
+    Returns:
+        dict with regime fields, or empty dict on failure.
+    """
+    try:
+        reader = _get_reader()
+        regime = reader.get_regime(ticker)
+        if not regime:
+            return {"regime": "unknown", "ticker": ticker.upper(), "note": "No regime data found"}
+        return regime
+    except Exception as exc:
+        logger.warning("lakehouse_regime(%s) failed: %s", ticker, exc)
+        return {"regime": "error", "ticker": ticker.upper(), "error": str(exc)}
+
+
+def lakehouse_signals(
+    self,
+    ticker: str = "",
+    min_confidence: float = 0.5,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Get curated signal feed from the lakehouse.
+
+    Returns validated signals with confidence scores, optionally filtered
+    by ticker and minimum confidence threshold.
+
+    Args:
+        ticker: Optional ticker filter (blank = all tickers).
+        min_confidence: Minimum signal confidence (0.0-1.0).
+        limit: Max signals to return.
+
+    Returns:
+        dict with ``signals`` list and ``count``.
+    """
+    try:
+        reader = _get_reader()
+        signals = reader.get_signals(
+            ticker=ticker,
+            signal_type="",
+            min_confidence=min_confidence,
+            limit=limit,
+        )
+        return {"signals": signals, "count": len(signals)}
+    except Exception as exc:
+        logger.warning("lakehouse_signals() failed: %s", exc)
+        return {"signals": [], "count": 0, "error": str(exc)}
+
+
+def lakehouse_factors(
+    self,
+    ticker: str = "",
+) -> dict[str, Any]:
+    """Get factor snapshot from the alpha-factory pipeline.
+
+    Returns computed factor values (momentum, mean-reversion, volatility,
+    etc.) for the given ticker.
+
+    Args:
+        ticker: Optional ticker filter (blank = all tickers).
+
+    Returns:
+        dict with ``factors`` list and ``count``.
+    """
+    try:
+        reader = _get_reader()
+        factors = reader.get_factors(ticker=ticker)
+        return {"factors": factors, "count": len(factors)}
+    except Exception as exc:
+        logger.warning("lakehouse_factors() failed: %s", exc)
+        return {"factors": [], "count": 0, "error": str(exc)}
+
+
+def lakehouse_strategy_candidates(
+    self,
+    regime: str = "",
+    min_sharpe: float = 1.0,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Get promoted strategy candidates filtered by regime and Sharpe.
+
+    Returns strategies that have been validated and promoted, ranked by
+    risk-adjusted performance.
+
+    Args:
+        regime: Optional regime label filter (blank = all regimes).
+        min_sharpe: Minimum Sharpe ratio threshold.
+        limit: Max strategies to return.
+
+    Returns:
+        dict with ``strategies`` list and ``count``.
+    """
+    try:
+        reader = _get_reader()
+        strategies = reader.get_strategy_pool(
+            regime_label=regime,
+            min_sharpe=min_sharpe,
+            limit=limit,
+        )
+        return {"strategies": strategies, "count": len(strategies)}
+    except Exception as exc:
+        logger.warning("lakehouse_strategy_candidates() failed: %s", exc)
+        return {"strategies": [], "count": 0, "error": str(exc)}
+
+
+def lakehouse_catalyst(
+    self,
+    ticker: str,
+) -> dict[str, Any]:
+    """Get catalyst grade for a ticker.
+
+    Returns event-driven catalyst analysis with grade, impact assessment,
+    and timing information.
+
+    Args:
+        ticker: Stock/crypto ticker.
+
+    Returns:
+        dict with catalyst fields, or empty dict if not found.
+    """
+    try:
+        reader = _get_reader()
+        catalyst = reader.get_catalyst(ticker)
+        if not catalyst:
+            return {"ticker": ticker.upper(), "catalyst_grade": "none", "note": "No catalyst data"}
+        return catalyst
+    except Exception as exc:
+        logger.warning("lakehouse_catalyst(%s) failed: %s", ticker, exc)
+        return {"ticker": ticker.upper(), "error": str(exc)}
+
+
+def lakehouse_experience(
+    self,
+    query_type: str = "all",
+    ticker: str = "",
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Search the experience bank for relevant lessons.
+
+    Returns lessons, mistakes, patterns, and adaptations from past
+    trading activity.
+
+    Args:
+        query_type: 'all', 'mistakes', 'patterns', 'adaptations', or 'insights'.
+        ticker: Optional ticker filter.
+        limit: Max results.
+
+    Returns:
+        dict with ``experience`` list and ``count``.
+    """
+    try:
+        reader = _get_reader()
+        severity = ""
+        if query_type == "mistakes":
+            severity = "critical"
+        elif query_type == "adaptations":
+            severity = "warning"
+
+        experience = reader.get_experience(
+            ticker=ticker,
+            severity=severity,
+            limit=limit,
+        )
+        return {"experience": experience, "count": len(experience)}
+    except Exception as exc:
+        logger.warning("lakehouse_experience() failed: %s", exc)
+        return {"experience": [], "count": 0, "error": str(exc)}
+
+
+def lakehouse_preflight(
+    self,
+    strategy_name: str = "",
+    ticker: str = "",
+) -> dict[str, Any]:
+    """Pre-flight failure/risk check before trading.
+
+    Aggregates known failures for the strategy and ticker, plus relevant
+    experience lessons.  Use this BEFORE committing to a trade.
+
+    Args:
+        strategy_name: Strategy to check (blank = all).
+        ticker: Ticker to check (blank = all).
+
+    Returns:
+        dict with ``failures``, ``experience``, and ``warnings`` list.
+    """
+    try:
+        reader = _get_reader()
+        failures = reader.get_failures(strategy_name=strategy_name, limit=10)
+        experience = reader.get_experience(ticker=ticker, severity="critical", limit=5)
+
+        warnings = []
+        if failures:
+            warnings.append(f"{len(failures)} known failure(s) for this strategy")
+        if experience:
+            warnings.append(f"{len(experience)} critical lesson(s) from experience bank")
+
+        return {
+            "failures": failures,
+            "experience": experience,
+            "warnings": warnings,
+            "clear": len(warnings) == 0,
+        }
+    except Exception as exc:
+        logger.warning("lakehouse_preflight() failed: %s", exc)
+        return {"failures": [], "experience": [], "warnings": [], "clear": True, "error": str(exc)}
+
+
+def lakehouse_intelligence(
+    self,
+    ticker: str,
+) -> dict[str, Any]:
+    """Get FULL intelligence packet for a ticker in one call.
+
+    Aggregates regime, signals, factors, catalyst, experience, failures,
+    and regime-strategy map into a single comprehensive packet.  This is
+    the primary tool for committee agents to get complete context.
+
+    Args:
+        ticker: Stock/crypto ticker.
+
+    Returns:
+        dict with all intelligence sections.
+    """
+    try:
+        reader = _get_reader()
+        intel = reader.get_ticker_intelligence(ticker)
+        return intel
+    except Exception as exc:
+        logger.warning("lakehouse_intelligence(%s) failed: %s", ticker, exc)
+        return {"ticker": ticker.upper(), "error": str(exc)}
+
+
+def lakehouse_write_lesson(
+    self,
+    text: str,
+    category: str = "insight",
+    severity: str = "info",
+    ticker: str = "",
+    regime: str = "",
+    tags: str = "[]",
+) -> dict[str, Any]:
+    """Write a lesson to the lakehouse ecosystem.
+
+    Persists a trading lesson, mistake, pattern, or adaptation so the
+    full agentic-quant-os ecosystem can learn from it.
+
+    Args:
+        text: The lesson content.
+        category: 'mistake', 'insight', 'pattern', or 'adaptation'.
+        severity: 'info', 'warning', or 'critical'.
+        ticker: Related ticker if applicable.
+        regime: Current market regime.
+        tags: JSON array string of tags, e.g. '["momentum", "overbought"]'.
+
+    Returns:
+        dict with ``stored`` bool and ``lesson_id``.
+    """
+    try:
+        reader = _get_reader()
+        from datetime import datetime, timezone
+
+        try:
+            tags_list = json.loads(tags) if isinstance(tags, str) else tags
+        except (json.JSONDecodeError, TypeError):
+            tags_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+        timestamp = (
+            self.get_datetime().isoformat()
+            if hasattr(self, "get_datetime")
+            else datetime.now(timezone.utc).isoformat()
+        )
+
+        record = {
+            "text": text,
+            "category": category,
+            "severity": severity,
+            "ticker": ticker.upper() if ticker else "",
+            "regime": regime,
+            "tags": tags_list,
+            "timestamp": timestamp,
+            "source": "nexus_trader_committee",
+        }
+
+        stored = reader.write_lesson(record)
+        return {"stored": stored, "lesson_id": f"lesson_{timestamp}"}
+    except Exception as exc:
+        logger.warning("lakehouse_write_lesson() failed: %s", exc)
+        return {"stored": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# LumiBot @agent_tool registration
+# ---------------------------------------------------------------------------
+
+try:
+    from lumibot.components.agents.tools import agent_tool
+
+    LAKEHOUSE_REGIME = agent_tool(
+        name="lakehouse_regime",
+        description=(
+            "Get the latest composite market regime for a ticker from the "
+            "lakehouse. Returns regime label (e.g. trending_up, mean_reverting, "
+            "volatile), confidence score, component breakdowns, volatility regime, "
+            "and trend direction. Use this as the first step in trade evaluation."
+        ),
+    )(lakehouse_regime)
+
+    LAKEHOUSE_SIGNALS = agent_tool(
+        name="lakehouse_signals",
+        description=(
+            "Get curated signal feed from the lakehouse. Returns validated "
+            "trading signals with confidence scores, source, and timing. "
+            "Filter by ticker and minimum confidence. Use to check what "
+            "the quant system is signaling for a given asset."
+        ),
+    )(lakehouse_signals)
+
+    LAKEHOUSE_FACTORS = agent_tool(
+        name="lakehouse_factors",
+        description=(
+            "Get factor snapshot from the alpha-factory pipeline. Returns "
+            "computed factor values (momentum, mean-reversion, volatility, "
+            "volume profile, etc.) for a ticker. Use to understand the "
+            "quantitative factor landscape for an asset."
+        ),
+    )(lakehouse_factors)
+
+    LAKEHOUSE_STRATEGY_CANDIDATES = agent_tool(
+        name="lakehouse_strategy_candidates",
+        description=(
+            "Get promoted strategy candidates filtered by regime and minimum "
+            "Sharpe ratio. Returns validated strategies ranked by risk-adjusted "
+            "performance. Use to find the best strategies for the current "
+            "market regime."
+        ),
+    )(lakehouse_strategy_candidates)
+
+    LAKEHOUSE_CATALYST = agent_tool(
+        name="lakehouse_catalyst",
+        description=(
+            "Get catalyst grade for a ticker from the lakehouse. Returns "
+            "event-driven catalyst analysis with grade, impact assessment, "
+            "and timing. Use to understand upcoming catalysts that may "
+            "affect the trade thesis."
+        ),
+    )(lakehouse_catalyst)
+
+    LAKEHOUSE_EXPERIENCE = agent_tool(
+        name="lakehouse_experience",
+        description=(
+            "Search the experience bank for relevant lessons, mistakes, "
+            "patterns, and adaptations from past trading. Filter by type "
+            "and ticker. Use to learn from historical context before "
+            "making a decision."
+        ),
+    )(lakehouse_experience)
+
+    LAKEHOUSE_PREFLIGHT = agent_tool(
+        name="lakehouse_preflight",
+        description=(
+            "Pre-flight failure/risk check before trading. Aggregates known "
+            "failures for a strategy and relevant critical lessons from the "
+            "experience bank. Always call this BEFORE committing to a trade "
+            "to check for known risks."
+        ),
+    )(lakehouse_preflight)
+
+    LAKEHOUSE_INTELLIGENCE = agent_tool(
+        name="lakehouse_intelligence",
+        description=(
+            "Get FULL intelligence packet for a ticker in one call. Aggregates "
+            "regime, signals, factors, catalyst, experience, failures, and "
+            "regime-strategy mapping. This is the primary comprehensive tool "
+            "for committee agents to get complete context on an asset."
+        ),
+    )(lakehouse_intelligence)
+
+    LAKEHOUSE_WRITE_LESSON = agent_tool(
+        name="lakehouse_write_lesson",
+        description=(
+            "Write a lesson to the lakehouse ecosystem. Persists trading "
+            "insights, mistakes, patterns, or adaptations so the full "
+            "quant system can learn. Use after important trades or when "
+            "discovering new patterns."
+        ),
+    )(lakehouse_write_lesson)
+
+except ImportError:
+    logger.debug(
+        "lumibot not available — @agent_tool decorators skipped for lakehouse tools"
+    )
+    LAKEHOUSE_REGIME = lakehouse_regime
+    LAKEHOUSE_SIGNALS = lakehouse_signals
+    LAKEHOUSE_FACTORS = lakehouse_factors
+    LAKEHOUSE_STRATEGY_CANDIDATES = lakehouse_strategy_candidates
+    LAKEHOUSE_CATALYST = lakehouse_catalyst
+    LAKEHOUSE_EXPERIENCE = lakehouse_experience
+    LAKEHOUSE_PREFLIGHT = lakehouse_preflight
+    LAKEHOUSE_INTELLIGENCE = lakehouse_intelligence
+    LAKEHOUSE_WRITE_LESSON = lakehouse_write_lesson

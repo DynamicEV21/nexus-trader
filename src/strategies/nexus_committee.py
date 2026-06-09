@@ -30,7 +30,6 @@ Key design principles
 
 Environment variables
 ---------------------
-* ``GOOGLE_API_KEY`` — for Gemini embeddings (vector memory)
 * ``NEXUS_LANCEDB_DIR`` — override LanceDB storage directory
 * ``NEXUS_MEMORY_DIR`` — override LumiBot memory JSONL directory
 * ``COMMITTEE_RESEARCH_MODEL`` — model for evidence researcher
@@ -50,7 +49,7 @@ Requirements
 * LumiBot with agent support (``strategy.agents``)
 * CrabQuant (importable, for regime detection)
 * Nexus Trader memory package (importable, for vector memory)
-* ``GOOGLE_API_KEY`` for vector embeddings
+* ``sentence-transformers`` with ``Qwen/Qwen3-Embedding-0.6B`` (local embeddings)
 """
 
 from __future__ import annotations
@@ -169,6 +168,7 @@ class NexusCommitteeStrategy(Strategy):
 
     def _register_tools(self) -> None:
         """Register custom @agent_tools so agents can call them."""
+        tool_count = 0
         try:
             from src.tools.regime_tool import DETECT_REGIME_TOOL
             from src.tools.signal_dashboard_tool import SIGNAL_DASHBOARD
@@ -186,10 +186,43 @@ class NexusCommitteeStrategy(Strategy):
             self.agents.register_tool(REMEMBER_DECISION)
             self.agents.register_tool(REMEMBER_LESSON)
             self.agents.register_tool(GET_MEMORY_STATS)
-
-            logger.info("Registered %d custom tools", 6)
+            tool_count += 6
         except Exception as exc:
-            logger.warning("Failed to register custom tools: %s — continuing with built-in tools only", exc)
+            logger.warning("Failed to register core tools: %s", exc)
+
+        # ── Register lakehouse tools (graceful degradation) ──
+        try:
+            from src.lakehouse.nexus_tools import (
+                LAKEHOUSE_REGIME,
+                LAKEHOUSE_SIGNALS,
+                LAKEHOUSE_FACTORS,
+                LAKEHOUSE_STRATEGY_CANDIDATES,
+                LAKEHOUSE_CATALYST,
+                LAKEHOUSE_EXPERIENCE,
+                LAKEHOUSE_PREFLIGHT,
+                LAKEHOUSE_INTELLIGENCE,
+                LAKEHOUSE_WRITE_LESSON,
+            )
+
+            lakehouse_tools = [
+                LAKEHOUSE_REGIME,
+                LAKEHOUSE_SIGNALS,
+                LAKEHOUSE_FACTORS,
+                LAKEHOUSE_STRATEGY_CANDIDATES,
+                LAKEHOUSE_CATALYST,
+                LAKEHOUSE_EXPERIENCE,
+                LAKEHOUSE_PREFLIGHT,
+                LAKEHOUSE_INTELLIGENCE,
+                LAKEHOUSE_WRITE_LESSON,
+            ]
+            for tool in lakehouse_tools:
+                self.agents.register_tool(tool)
+            tool_count += len(lakehouse_tools)
+            logger.info("Registered lakehouse tools (lakehouse integration active)")
+        except Exception as exc:
+            logger.warning("Lakehouse tools not available: %s — continuing without lakehouse integration", exc)
+
+        logger.info("Registered %d custom tools total", tool_count)
 
     def _run_memory_bridge(self) -> None:
         """Sync LumiBot JSONL memory into vector memory (non-blocking, best-effort)."""
@@ -337,6 +370,41 @@ class NexusCommitteeStrategy(Strategy):
         except Exception:
             context["memory_stats"] = {"enabled": False}
 
+        # ── Lakehouse intelligence (graceful degradation) ──
+        try:
+            from src.lakehouse.reader import get_reader
+            lakehouse = get_reader()
+            hc = lakehouse.health_check()
+            if hc.get("connected"):
+                # Pre-fetch regime for all universe tickers
+                lakehouse_regimes = {}
+                for sym in universe:
+                    reg = lakehouse.get_regime(sym)
+                    if reg:
+                        lakehouse_regimes[sym] = reg
+                context["lakehouse_regimes"] = lakehouse_regimes
+                context["lakehouse_available"] = True
+                # Include strategy candidates from pool
+                strats = lakehouse.get_strategy_pool(min_sharpe=1.0, limit=10)
+                if strats:
+                    context["lakehouse_strategy_candidates"] = [
+                        {"name": s.get("name"), "sharpe": s.get("backtest_sharpe"), "status": s.get("status")}
+                        for s in strats[:5]
+                    ]
+                # Include recent failures for awareness
+                failures = lakehouse.get_failures(limit=10)
+                if failures:
+                    context["lakehouse_failures"] = [
+                        {"strategy": f.get("strategy_name"), "reason": f.get("failure_reason", "")[:80]}
+                        for f in failures[:5]
+                    ]
+                logger.debug("Lakehouse context injected: %d regimes, %d strategies, %d failures",
+                             len(lakehouse_regimes), len(strats), len(failures))
+            else:
+                context["lakehouse_available"] = False
+        except Exception:
+            context["lakehouse_available"] = False
+
         return context
 
     # ------------------------------------------------------------------
@@ -358,12 +426,29 @@ For each candidate symbol, use these tools:
 3. **query_trade_memory(query, symbol, regime)** — search past decisions and
    lessons for context on how similar setups played out.
 4. **get_memory_stats()** — check how much historical data we have.
-5. Any built-in tools for price data, news, fundamentals.
+
+Lakehouse tools (if available — these pull from the quant ecosystem lakehouse):
+5. **lakehouse_intelligence(ticker)** — FULL intelligence packet: regime from
+   Regime Intelligence, curated signals, alpha-factory factors, catalyst grades,
+   experience bank lessons, failure history, and strategy candidates. Use this
+   for any ticker in the universe.
+6. **lakehouse_regime(ticker)** — latest composite regime from the lakehouse.
+7. **lakehouse_signals(ticker)** — curated signal feed from alpha-lab, alpha-factory,
+   regime-intelligence (confidence-filtered).
+8. **lakehouse_factors(ticker)** — factor snapshot from alpha-factory.
+9. **lakehouse_strategy_candidates(regime)** — promoted strategies with Sharpe>1.0.
+10. **lakehouse_preflight(strategy_name, ticker)** — check failure history before trading.
+11. Any built-in tools for price data, news, fundamentals.
+
+If lakehouse tools are available, ALWAYS use lakehouse_intelligence as your first
+source for each ticker — it aggregates everything. Supplement with signal_dashboard
+for real-time technical data.
 
 Output structured markdown with:
-- Market regime and confidence
+- Market regime and confidence (from lakehouse if available, detect_regime otherwise)
 - Candidates reviewed (with signal_dashboard results)
 - Top long candidates (with rationale)
+- Lakehouse intelligence summary (if available)
 - Technical summary per candidate
 - Bull evidence
 - Bear evidence
@@ -379,12 +464,17 @@ You are the Bull Researcher. You cannot place, modify, or cancel trades.
 Build the strongest long-only case from the evidence pack. You may use:
 - **signal_dashboard(symbol)** to confirm technical alignment
 - **query_trade_memory(query, symbol, regime)** to find historical winning patterns
+- **lakehouse_intelligence(ticker)** for aggregated lakehouse data per ticker
+- **lakehouse_factors(ticker)** for alpha-factory factor analysis
+- **lakehouse_strategy_candidates(regime)** for strategies that work in current regime
+- **lakehouse_experience(ticker)** for lessons from the quant ecosystem
 - Any read-only tools to dig deeper
 
 Focus on:
 - Catalysts — what makes this trade work *now*?
 - Technical setup — is the signal dashboard aligned?
 - Regime fit — is the strategy appropriate for current conditions?
+- Lakehouse factors — do alpha-factory factors support the thesis?
 - Historical precedents — have similar setups worked before?
 - Why the reward justifies the risk
 
@@ -407,11 +497,15 @@ reduce size, or demand more evidence. Use:
 - **query_trade_memory(query)** to find past losses and lessons in similar conditions
 - **detect_regime()** to check if current conditions contradict the thesis
 - **signal_dashboard(symbol)** to find technical weaknesses
+- **lakehouse_preflight(strategy_name, ticker)** to check failure history
+- **lakehouse_experience(ticker)** for ecosystem lessons about what went wrong
+- **lakehouse_intelligence(ticker)** for full risk picture from the lakehouse
 
 Look for:
 - Regime mismatch — is the strategy wrong for current conditions?
 - Technical weaknesses — overbought, bearish divergences, resistance
 - Historical precedent — have similar setups failed before?
+- Lakehouse failures — have related strategies failed in the ecosystem?
 - Missing data or high uncertainty
 - Conflicting signals across the evidence pack
 
@@ -442,11 +536,15 @@ Before trading:
    future learning.
 8. If you identify important lessons (patterns, mistakes, adaptations),
    call remember_lesson to store them.
+9. **If lakehouse tools are available**, use lakehouse_write_lesson to
+   persist important lessons to the ecosystem experience bank for cross-project learning.
 
 Use these memory tools:
 - **query_trade_memory** — check what history tells us about similar setups
 - **remember_decision** — persist this decision for future reference
 - **remember_lesson** — capture lessons for the experience bank
+- **lakehouse_preflight(strategy_name, ticker)** — check ecosystem failures before trading
+- **lakehouse_write_lesson** — write lessons to the ecosystem (if available)
 
 Return:
 - Final decision (buy/sell/hold per candidate)
