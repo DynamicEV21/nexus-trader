@@ -319,13 +319,13 @@ def lakehouse_write_lesson(
         )
 
         record = {
-            "text": text,
+            "detail": text,
+            "title": record.get("title", f"Lesson: {category}"),
             "category": category,
             "severity": severity,
-            "ticker": ticker.upper() if ticker else "",
+            "ticker": ticker if ticker else "",
             "regime": regime,
             "tags": tags_list,
-            "timestamp": timestamp,
             "source": "nexus_trader_committee",
         }
 

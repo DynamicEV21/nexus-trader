@@ -56,9 +56,21 @@ class NexusLakehouseReader:
     # ── Lazy connection (read-only, no bootstrap) ─────────────────────
 
     def _con_get(self) -> Any:
-        """Lazily open a read-only DuckDB connection."""
+        """Lazily open a read-only DuckDB connection.
+
+        Verifies the connection is still alive before returning it.
+        """
         if self._con is not None:
-            return self._con
+            try:
+                # Ping the connection — if it's closed/corrupted, this raises
+                self._con.execute("SELECT 1")
+                return self._con
+            except Exception:
+                try:
+                    self._con.close()
+                except Exception:
+                    pass
+                self._con = None
         try:
             import duckdb
             self._con = duckdb.connect(self._db_path, read_only=True)
@@ -159,16 +171,16 @@ class NexusLakehouseReader:
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         """Promoted/high-Sharpe strategies from v_nexus_strategy_pool."""
+        clauses = ["backtest_sharpe >= ?"]
+        params: list[Any] = [min_sharpe]
         if regime_label:
-            return self._query(
-                "SELECT * FROM v_nexus_strategy_pool WHERE backtest_sharpe >= ? "
-                "ORDER BY backtest_sharpe DESC NULLS LAST LIMIT ?",
-                [min_sharpe, limit],
-            )
+            clauses.append("type = ?")  # type column holds regime label
+            params.append(regime_label)
+        where = "WHERE " + " AND ".join(clauses)
+        params.append(limit)
         return self._query(
-            "SELECT * FROM v_nexus_strategy_pool WHERE backtest_sharpe >= ? "
-            "ORDER BY backtest_sharpe DESC NULLS LAST LIMIT ?",
-            [min_sharpe, limit],
+            f"SELECT * FROM v_nexus_strategy_pool {where} "
+            f"ORDER BY backtest_sharpe DESC NULLS LAST LIMIT ?", params
         )
 
     # ── Catalyst ────────────────────────────────────────────────────
@@ -334,35 +346,29 @@ class NexusLakehouseReader:
             "connected": False,
             "views": {},
         }
-        try:
-            import duckdb
+        con = self._con_get()
+        if con is None:
             if not os.path.exists(self._db_path):
                 result["error"] = "Database file not found"
-                return result
-
-            con = duckdb.connect(self._db_path, read_only=True)
-            result["connected"] = True
-
-            for vname in [
-                "v_nexus_regime",
-                "v_nexus_signal_feed",
-                "v_nexus_factors",
-                "v_nexus_strategy_pool",
-                "v_nexus_catalyst_digest",
-                "v_nexus_experience",
-                "v_nexus_failures",
-                "v_nexus_regime_strategy_map",
-            ]:
-                try:
-                    cnt = con.execute(f"SELECT COUNT(*) FROM {vname}").fetchone()[0]
-                    result["views"][vname] = cnt
-                except Exception as e:
-                    result["views"][vname] = f"error: {e}"
-
-            con.close()
-        except Exception as exc:
-            result["error"] = str(exc)
-
+            else:
+                result["error"] = "Connection failed"
+            return result
+        result["connected"] = True
+        for vname in [
+            "v_nexus_regime",
+            "v_nexus_signal_feed",
+            "v_nexus_factors",
+            "v_nexus_strategy_pool",
+            "v_nexus_catalyst_digest",
+            "v_nexus_experience",
+            "v_nexus_failures",
+            "v_nexus_regime_strategy_map",
+        ]:
+            try:
+                cnt = con.execute(f"SELECT COUNT(*) FROM {vname}").fetchone()[0]
+                result["views"][vname] = cnt
+            except Exception as e:
+                result["views"][vname] = f"error: {e}"
         return result
 
     # ── Lifecycle ──────────────────────────────────────────────────
