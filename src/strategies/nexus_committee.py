@@ -128,6 +128,7 @@ class NexusCommitteeStrategy(Strategy):
         trader_model = os.environ.get("COMMITTEE_TRADER_MODEL", "openai/gpt-4o")
 
         # ── Register custom tools ──
+        self._lakehouse_enabled = self.parameters.get("lakehouse_enabled", True)
         self._register_tools()
 
         # ── Create committee agents ──
@@ -161,9 +162,10 @@ class NexusCommitteeStrategy(Strategy):
             self._run_memory_bridge()
 
         logger.info(
-            "NexusCommittee initialized: universe=%s, models=[%s, %s, %s, %s]",
+            "NexusCommittee initialized: universe=%s, models=[%s, %s, %s, %s], lakehouse=%s",
             self.parameters.get("universe"),
             research_model, bull_model, bear_model, trader_model,
+            self._lakehouse_enabled,
         )
 
     def _register_tools(self) -> None:
@@ -190,8 +192,9 @@ class NexusCommitteeStrategy(Strategy):
         except Exception as exc:
             logger.warning("Failed to register core tools: %s", exc)
 
-        # ── Register lakehouse tools (graceful degradation) ──
-        try:
+        # ── Register lakehouse tools (graceful degradation + mode switch) ──
+        if self._lakehouse_enabled:
+            try:
             from src.lakehouse.nexus_tools import (
                 LAKEHOUSE_REGIME,
                 LAKEHOUSE_SIGNALS,
@@ -370,8 +373,8 @@ class NexusCommitteeStrategy(Strategy):
         except Exception:
             context["memory_stats"] = {"enabled": False}
 
-        # ── Lakehouse intelligence (graceful degradation) ──
-        try:
+        # ── Lakehouse intelligence (mode-gated, graceful degradation) ──
+        if self._lakehouse_enabled:
             from src.lakehouse.reader import get_reader
             lakehouse = get_reader()
             hc = lakehouse.health_check()
@@ -572,6 +575,7 @@ if __name__ == "__main__":
     parser.add_argument("--budget", type=float, default=10000, help="Starting budget")
     parser.add_argument("--symbols", nargs="*", default=DEFAULT_UNIVERSE[:5], help="Symbols to trade")
     parser.add_argument("--no-memory-bridge", action="store_true", help="Skip memory bridge")
+    parser.add_argument("--no-lakehouse", action="store_true", help="Disable lakehouse integration (prevents backtest data leakage)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -583,6 +587,7 @@ if __name__ == "__main__":
         "max_new_positions_per_run": 2,
         "enable_notifications": False,
         "use_memory_bridge": not args.no_memory_bridge,
+        "lakehouse_enabled": not args.no_lakehouse,
     }
 
     trading_fee = TradingFee(percent_fee=0.001)
