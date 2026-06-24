@@ -255,14 +255,28 @@ class LiveStratForgeAdapter(Strategy):
     # ── Signal Computation ──────────────────────────────────────────────
 
     def _fetch_recent_data(self) -> Optional[pd.DataFrame]:
-        """Fetch recent OHLCV bars from the broker."""
+        """Fetch recent OHLCV bars from the broker.
+
+        LumiBot's signature is::
+            get_historical_prices(asset, length, timestep="", timeshift=None,
+                                   quote=None, ...)
+
+        The previous version passed ``quote`` as the 2nd positional, which
+        bound it to ``length`` (causing a TypeError). It then passed
+        ``length`` as the 3rd positional, which LumiBot interpreted as the
+        ``timestep`` parameter — and we also passed ``timestep=self.sleeptime``
+        as a kwarg, producing "got multiple values for argument 'timestep'".
+        That error was silently caught and returned 0 bars, so the live
+        paper-trade bots were never actually placing orders. Use kwargs for
+        ``length``, ``timestep``, and ``quote`` to avoid the trap.
+        """
         lookback = self.parameters.get("lookback_bars", DEFAULT_LOOKBACK)
         try:
             bars = self.get_historical_prices(
                 self.base_asset,
-                self.quote_asset,
-                lookback,
+                length=lookback,
                 timestep=self.sleeptime,
+                quote=self.quote_asset,
             )
             if bars is None or len(bars) == 0:
                 return None
