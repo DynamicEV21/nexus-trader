@@ -33,6 +33,62 @@ Every agent working on this project MUST:
 
 ## Key Architecture Concepts
 
+### Vector Memory Stack — DO NOT RE-INSTALL OR RE-CREATE
+
+**Sentence-transformers + Qwen3 + LanceDB is already wired and working.** Do not:
+
+- ❌ `pip install sentence-transformers` in the lumibot venv — runs from aqos venv via subprocess instead
+- ❌ Re-create the LanceDB instance at a different path
+- ❌ Try to use a remote embedding API (OpenAI, Cohere) — costs $, adds latency, breaks the dual-write pipeline
+- ❌ Replace Qwen3-Embedding-0.6B with a smaller model without asking first — 1.2 GB on disk is intentional
+
+**The stack:**
+
+| Layer | Component | Where |
+|---|---|---|
+| Engine | `sentence-transformers` 5.5.1 | `/home/Zev/development/agentic-quant-os/.venv/lib/.../site-packages/sentence_transformers` (4.5 MB) |
+| Model | `Qwen/Qwen3-Embedding-0.6B` | `~/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/` (1.2 GB) |
+| Vector store | `lancedb` 0.33.0 | `/home/Zev/development/agentic-quant-os/data/vectors/nexus_decisions.lance` + `nexus_lessons.lance` |
+| Bridge | `src/memory/bridge.py` | Reads LumiBot JSONL → writes LanceDB |
+| Auto-sync | `src/strategies/nexus_committee.py` Phase 6 | Runs bridge as subprocess after each committee iteration |
+| Env flag | `NEXUS_BRIDGE_AUTO_SYNC=1` (default 0) | Set in nexus-trade/.env to enable |
+
+**If a future agent thinks "sentence-transformers isn't installed, let me pip install it" — STOP.** Check the aqos venv first:
+
+```bash
+ls /home/Zev/development/agentic-quant-os/.venv/lib/python*/site-packages/ | grep -iE "sentence|transformers|lancedb|torch"
+```
+
+If those four are present, the stack is good. The reason the lumibot venv doesn't have them is intentional: nexus_committee.py invokes the bridge as `subprocess.run([aqos_venv_python, ...])` precisely to keep lumibot venv lightweight.
+
+**Verify it's working:**
+
+```bash
+cd /home/Zev/development/nexus-trade
+export NEXUS_VENV_AQOS=/home/Zev/development/agentic-quant-os/.venv/bin/python
+$NEXUS_VENV_AQOS -m src.memory.bridge --strategy Nexus_Trader --dry-run
+# Should show: decisions.jsonl: N read, N unique ready to bridge
+```
+
+### Regime Detection — Two Views, Champion by Flag
+
+`quant.duckdb` has TWO regime views:
+
+- `v_nexus_regime` — original, includes `composite` + `ensemble` only (excludes `closed_loop`)
+- `v_nexus_regime_champion` — preferred detectors with priority `closed_loop` > `composite` > `ensemble`
+
+**Champion detector** = `closed_loop` (995 rows, BTC-USDT only, last 2026-06-18). Without the flag, BTC-USDT gets whatever `composite` last wrote, which can be 13 days stale.
+
+Toggle with `NEXUS_REGIME_CHAMPION_ONLY=1` in the environment running the PM agent. **Default is 0** (off) for A/B testability.
+
+View was bootstrapped via runtime `CREATE OR REPLACE VIEW` — **not in git**. If quant.duckdb is ever rebuilt from scratch, re-run the bootstrap SQL (see `memory/regime-champion-wiring-2026-06-24.md`).
+
+### DuckDB Quant File — Don't Open Directly
+
+If you need data from the Nexus curated views, **go through `src/lakehouse/reader.py`** (the `NexusLakehouseReader` class) or use the `get_reader()` singleton. Do not call `duckdb.connect('quant.duckdb')` directly anywhere — the reader uses ATTACH into a fresh in-memory connection (see `reader.py:_con_get`) on purpose: it bypasses a DuckDB v1.5.x catalog-cache bug where direct-connect reads return stale view definitions after the file is rewritten.
+
+**If you find yourself writing `duckdb.connect(quant.duckdb_path)` somewhere new — STOP.** Use `get_reader()` and add a method to it.
+
 ### Two Caching Layers
 
 1. **LumiBot Replay Cache** (local disk, any model)
@@ -173,6 +229,22 @@ os.environ.setdefault("LUMIBOT_CACHE_FOLDER", "/tmp/lumibot_cache")
 - LiteLLM doesn't recognize `ollama-cloud/` provider prefix
 
 ---
+
+## Environment Flags (set in nexus-trade/.env)
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `NEXUS_LANCEDB_DIR` | `/home/Zev/development/agentic-quant-os/data/vectors` | Canonical LanceDB persist dir. Used by both bridge and nexus_vector_memory. Do not change. |
+| `NEXUS_BRIDGE_AUTO_SYNC` | `0` (off) | When `1`, nexus_committee runs the bridge subprocess after each iteration. Requires `NEXUS_VENV_AQOS`. |
+| `NEXUS_VENV_AQOS` | `/home/Zev/development/agentic-quant-os/.venv/bin/python` | Path to the aqos venv Python that has sentence-transformers + lancedb. |
+| `NEXUS_REGIME_CHAMPION_ONLY` | `0` (off) | When `1`, PM agent reads `v_nexus_regime_champion` (prefers `closed_loop`) instead of `v_nexus_regime`. |
+
+**To enable both new features for a smoke test:**
+```bash
+export NEXUS_BRIDGE_AUTO_SYNC=1
+export NEXUS_REGIME_CHAMPION_ONLY=1
+```
+(Or edit nexus-trade/.env and set both to `1`.)
 
 ## Available Tools (40+ built-in)
 
