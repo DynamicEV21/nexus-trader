@@ -38,6 +38,11 @@ _DEFAULT_DB_PATH = os.path.expanduser(
     os.environ.get("NEXUS_LAKEHOUSE_PATH", "~/development/agentic-quant-os/data/quant.duckdb")
 )
 
+# Registry of active reader instances — used by aqs_writer to close them
+# before opening a write connection to the same file (DuckDB single-
+# connection-per-file rule).
+_READERS: list["NexusLakehouseReader"] = []
+
 
 class NexusLakehouseReader:
     """Lazy-inited lakehouse reader using curated DuckDB views.
@@ -52,11 +57,19 @@ class NexusLakehouseReader:
     def __init__(self, db_path: Optional[str] = None) -> None:
         self._db_path = db_path or _DEFAULT_DB_PATH
         self._con: Any | None = None
+        if self not in _READERS:
+            _READERS.append(self)
 
     # ── Lazy connection (read-only, no bootstrap) ─────────────────────
 
     def _con_get(self) -> Any:
         """Lazily open a read-only DuckDB connection.
+
+        Uses ``ATTACH`` against an in-memory connection rather than
+        ``duckdb.connect(path)`` to bypass a DuckDB v1.5.x catalog-cache
+        bug where direct-connect reads can return stale view/table
+        definitions after the file has been rewritten. ``ATTACH`` always
+        re-reads the catalog from disk.
 
         Verifies the connection is still alive before returning it.
         """
@@ -73,8 +86,16 @@ class NexusLakehouseReader:
                 self._con = None
         try:
             import duckdb
-            self._con = duckdb.connect(self._db_path, read_only=True)
-            logger.info("Lakehouse reader connected to %s", self._db_path)
+            # Use ATTACH into a fresh in-memory connection. This forces a
+            # fresh catalog load and avoids the per-file stale-catalog issue.
+            self._con = duckdb.connect(":memory:")
+            # Escape single quotes in path for SQL
+            esc_path = self._db_path.replace("'", "''")
+            self._con.execute(
+                f"ATTACH '{esc_path}' AS nexus_lake (READ_ONLY)"
+            )
+            self._con.execute("USE nexus_lake")
+            logger.info("Lakehouse reader attached to %s via ATTACH", self._db_path)
         except Exception as exc:
             logger.error("Failed to connect to lakehouse: %s", exc)
             self._con = None
@@ -167,20 +188,43 @@ class NexusLakehouseReader:
     def get_strategy_pool(
         self,
         regime_label: str = "",
-        min_sharpe: float = 1.0,
+        min_composite: float = 49.0,
+        min_sharpe: float = 0.0,
+        ticker: str = "",
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """Promoted/high-Sharpe strategies from v_nexus_strategy_pool."""
-        clauses = ["backtest_sharpe >= ?"]
-        params: list[Any] = [min_sharpe]
+        """Validated crypto strategies from v_nexus_strategy_pool.
+
+        The view reads from ``backtest_results_v2`` and is pre-filtered to
+        crypto-relevant tickers (BTC, ETH, SOL, ALL, MULTI) with
+        ``composite_score >= 49`` and ``status IN ('winner', 'tested')``.
+
+        Args:
+            regime_label: Filter by regime_best_tag or regime_label.
+            min_composite: Minimum composite score (default 49.0, the WF gate).
+            min_sharpe: Minimum in-sample Sharpe ratio.
+            ticker: Filter by ticker (e.g. 'BTC').
+            limit: Max results.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if min_composite > 0:
+            clauses.append("composite_score >= ?")
+            params.append(min_composite)
+        if min_sharpe > 0:
+            clauses.append("sharpe >= ?")
+            params.append(min_sharpe)
+        if ticker:
+            clauses.append("ticker = ?")
+            params.append(ticker)
         if regime_label:
-            clauses.append("type = ?")  # type column holds regime label
-            params.append(regime_label)
-        where = "WHERE " + " AND ".join(clauses)
+            clauses.append("(regime_best_tag = ? OR regime_label = ?)")
+            params.extend([regime_label, regime_label])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         return self._query(
             f"SELECT * FROM v_nexus_strategy_pool {where} "
-            f"ORDER BY backtest_sharpe DESC NULLS LAST LIMIT ?", params
+            f"ORDER BY composite_score DESC NULLS LAST LIMIT ?", params
         )
 
     # ── Catalyst ────────────────────────────────────────────────────
@@ -307,14 +351,71 @@ class NexusLakehouseReader:
 
     # ── Write-back (requires QuantClient, not read-only) ───────────
 
+    def _quant_client(self):
+        """Load QuantClient via importlib to dodge the ``src`` namespace
+        collision between nexus-trade/src and agentic-quant-os/src.
+
+        Creates a synthetic package ``aqos_src`` so relative imports inside
+        ``client.py`` (``from .schema import ...``) resolve correctly.
+
+        Returns the QuantClient class or None if unavailable.
+        """
+        try:
+            import importlib.util
+            import sys
+            aqos_src = os.path.expanduser(
+                os.environ.get("AQOS_SRC", "~/development/agentic-quant-os/src")
+            )
+            if not os.path.isdir(aqos_src):
+                logger.warning("AQS src directory not found: %s", aqos_src)
+                return None
+            pkg_name = "aqos_src_reader"
+            if pkg_name not in sys.modules:
+                pkg = type(sys)(pkg_name)
+                pkg.__path__ = [aqos_src]
+                pkg.__package__ = pkg_name
+                sys.modules[pkg_name] = pkg
+                for mod_name in ("schema", "db_connection"):
+                    mod_path = os.path.join(aqos_src, f"{mod_name}.py")
+                    if os.path.exists(mod_path):
+                        full_name = f"{pkg_name}.{mod_name}"
+                        spec = importlib.util.spec_from_file_location(
+                            full_name, mod_path,
+                            submodule_search_locations=[aqos_src],
+                        )
+                        if spec and spec.loader:
+                            mod = importlib.util.module_from_spec(spec)
+                            sys.modules[full_name] = mod
+                            mod.__package__ = pkg_name
+                            spec.loader.exec_module(mod)
+            client_path = os.path.join(aqos_src, "client.py")
+            full_name = f"{pkg_name}.client"
+            spec = importlib.util.spec_from_file_location(
+                full_name, client_path,
+                submodule_search_locations=[aqos_src],
+            )
+            if not spec or not spec.loader:
+                return None
+            mod = importlib.util.module_from_spec(spec)
+            mod.__package__ = pkg_name
+            sys.modules[full_name] = mod
+            spec.loader.exec_module(mod)
+            return mod.QuantClient
+        except Exception as exc:
+            logger.warning("_quant_client() failed: %s", exc)
+            return None
+
     def write_trade_result(self, record: dict[str, Any]) -> bool:
         """Write a trade result back to the lakehouse.
 
         Requires QuantClient (write access). Returns False if unavailable.
         """
         try:
-            from src.client import QuantClient
-            c = QuantClient(db_path=self._db_path)
+            QC = self._quant_client()
+            if QC is None:
+                logger.warning("write_trade_result(): QuantClient unavailable")
+                return False
+            c = QC(db_path=self._db_path)
             c.write_nexus_trade_result(record)
             c.close()
             return True
@@ -328,8 +429,11 @@ class NexusLakehouseReader:
         Requires QuantClient (write access). Returns False if unavailable.
         """
         try:
-            from src.client import QuantClient
-            c = QuantClient(db_path=self._db_path)
+            QC = self._quant_client()
+            if QC is None:
+                logger.warning("write_lesson(): QuantClient unavailable")
+                return False
+            c = QC(db_path=self._db_path)
             c.write_nexus_lesson(record)
             c.close()
             return True

@@ -54,6 +54,7 @@ Requirements
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -106,6 +107,13 @@ class NexusCommitteeStrategy(Strategy):
         """Set up the committee agents, tools, and state."""
         self.sleeptime = "1D"
 
+        # Register this strategy with the tool context so @agent_tool
+        # functions can access it WITHOUT taking ``self`` as a parameter.
+        # This fixes the self-binding bug where ADK's FunctionTool was
+        # exposing ``self`` as a required parameter to the AI model.
+        from src.tools._strategy_context import register_strategy
+        register_strategy(self)
+
         # Persistent state across iterations
         self.vars.last_evidence_pack = None
         self.vars.last_bull_case = None
@@ -121,39 +129,52 @@ class NexusCommitteeStrategy(Strategy):
             except Exception:
                 logger.warning("Notifications not configured — continuing without")
 
-        # Model selection from environment
-        research_model = os.environ.get("COMMITTEE_RESEARCH_MODEL", "openai/gpt-4o-mini")
-        bull_model = os.environ.get("COMMITTEE_BULL_MODEL", "openai/gpt-4o")
-        bear_model = os.environ.get("COMMITTEE_BEAR_MODEL", "openai/gpt-4o")
-        trader_model = os.environ.get("COMMITTEE_TRADER_MODEL", "openai/gpt-4o")
+        # Model selection from environment — MiniMax-M3 is the default
+        # because it's cost-effective with strong reasoning.  Override per-role
+        # via COMMITTEE_*_MODEL env vars if needed.
+        _default_model = "minimax/MiniMax-M3"
+        research_model = os.environ.get("COMMITTEE_RESEARCH_MODEL", _default_model)
+        bull_model = os.environ.get("COMMITTEE_BULL_MODEL", _default_model)
+        bear_model = os.environ.get("COMMITTEE_BEAR_MODEL", _default_model)
+        trader_model = os.environ.get("COMMITTEE_TRADER_MODEL", _default_model)
 
-        # ── Register custom tools ──
+        # ── Collect custom tools ──
         self._lakehouse_enabled = self.parameters.get("lakehouse_enabled", True)
-        self._register_tools()
+        core_tools = self._load_core_tools()
+        lakehouse_tools = self._load_lakehouse_tools()
+        stratforge_tool = self._load_stratforge_tools()
+
+        # All tools go to every agent except stratforge (PM only)
+        all_read_tools = core_tools + lakehouse_tools
+        pm_tools = core_tools + lakehouse_tools + stratforge_tool
 
         # ── Create committee agents ──
         self.agents.create(
             name="evidence_researcher",
             model=research_model,
             allow_trading=False,
+            tools=all_read_tools,
             system_prompt=self._evidence_researcher_prompt(),
         )
         self.agents.create(
             name="bull_researcher",
             model=bull_model,
             allow_trading=False,
+            tools=all_read_tools,
             system_prompt=self._bull_researcher_prompt(),
         )
         self.agents.create(
             name="bear_researcher",
             model=bear_model,
             allow_trading=False,
+            tools=all_read_tools,
             system_prompt=self._bear_researcher_prompt(),
         )
         self.agents.create(
             name="portfolio_manager",
             model=trader_model,
             allow_trading=True,
+            tools=pm_tools,
             system_prompt=self._portfolio_manager_prompt(),
         )
 
@@ -168,9 +189,9 @@ class NexusCommitteeStrategy(Strategy):
             self._lakehouse_enabled,
         )
 
-    def _register_tools(self) -> None:
-        """Register custom @agent_tools so agents can call them."""
-        tool_count = 0
+    def _load_core_tools(self) -> list:
+        """Load core @agent_tool tools (regime, dashboard, memory, signal eval)."""
+        tools = []
         try:
             from src.tools.regime_tool import DETECT_REGIME_TOOL
             from src.tools.signal_dashboard_tool import SIGNAL_DASHBOARD
@@ -180,21 +201,26 @@ class NexusCommitteeStrategy(Strategy):
                 REMEMBER_LESSON,
                 GET_MEMORY_STATS,
             )
-
-            # Register each tool — LumiBot auto-detects @agent_tool metadata
-            self.agents.register_tool(DETECT_REGIME_TOOL)
-            self.agents.register_tool(SIGNAL_DASHBOARD)
-            self.agents.register_tool(QUERY_TRADE_MEMORY)
-            self.agents.register_tool(REMEMBER_DECISION)
-            self.agents.register_tool(REMEMBER_LESSON)
-            self.agents.register_tool(GET_MEMORY_STATS)
-            tool_count += 6
+            from src.tools.evaluate_signal import EVALUATE_SIGNAL
+            tools = [
+                DETECT_REGIME_TOOL,
+                SIGNAL_DASHBOARD,
+                QUERY_TRADE_MEMORY,
+                REMEMBER_DECISION,
+                REMEMBER_LESSON,
+                GET_MEMORY_STATS,
+                EVALUATE_SIGNAL,
+            ]
+            logger.info("Loaded %d core tools", len(tools))
         except Exception as exc:
-            logger.warning("Failed to register core tools: %s", exc)
+            logger.warning("Failed to load core tools: %s", exc)
+        return tools
 
-        # ── Register lakehouse tools (graceful degradation + mode switch) ──
-        if self._lakehouse_enabled:
-            try:
+    def _load_lakehouse_tools(self) -> list:
+        """Load lakehouse @agent_tool tools (regime, signals, factors, etc.)."""
+        if not self._lakehouse_enabled:
+            return []
+        try:
             from src.lakehouse.nexus_tools import (
                 LAKEHOUSE_REGIME,
                 LAKEHOUSE_SIGNALS,
@@ -206,8 +232,7 @@ class NexusCommitteeStrategy(Strategy):
                 LAKEHOUSE_INTELLIGENCE,
                 LAKEHOUSE_WRITE_LESSON,
             )
-
-            lakehouse_tools = [
+            tools = [
                 LAKEHOUSE_REGIME,
                 LAKEHOUSE_SIGNALS,
                 LAKEHOUSE_FACTORS,
@@ -218,14 +243,21 @@ class NexusCommitteeStrategy(Strategy):
                 LAKEHOUSE_INTELLIGENCE,
                 LAKEHOUSE_WRITE_LESSON,
             ]
-            for tool in lakehouse_tools:
-                self.agents.register_tool(tool)
-            tool_count += len(lakehouse_tools)
-            logger.info("Registered lakehouse tools (lakehouse integration active)")
+            logger.info("Loaded %d lakehouse tools", len(tools))
+            return tools
         except Exception as exc:
-            logger.warning("Lakehouse tools not available: %s — continuing without lakehouse integration", exc)
+            logger.warning("Lakehouse tools not available: %s — continuing without", exc)
+            return []
 
-        logger.info("Registered %d custom tools total", tool_count)
+    def _load_stratforge_tools(self) -> list:
+        """Load StratForge query tool for the PM agent."""
+        try:
+            from src.lakehouse.stratforge_query import QUERY_STRATFORGE_STRATEGIES
+            logger.info("Loaded StratForge query tool")
+            return [QUERY_STRATFORGE_STRATEGIES]
+        except Exception as exc:
+            logger.warning("StratForge query tool not available: %s", exc)
+            return []
 
     def _run_memory_bridge(self) -> None:
         """Sync LumiBot JSONL memory into vector memory (non-blocking, best-effort)."""
@@ -332,7 +364,142 @@ class NexusCommitteeStrategy(Strategy):
         )
         summary = decision.summary or decision.text
         self.log_message(f"[NexusCommittee run {run}] {summary}", color="yellow")
+
+        # ── Phase 5: Write-back to AQS agent_memory ──
+        self._write_decision_to_aqs(
+            universe=universe,
+            summary=summary,
+            evidence=self.vars.last_evidence_pack or "",
+            bull_case=self.vars.last_bull_case or "",
+            bear_case=self.vars.last_bear_case or "",
+            run_id=run,
+            regime=context.get("current_regime", "unknown"),
+        )
+
         logger.info("[NexusCommittee run %d] Complete", run)
+
+    def _write_decision_to_aqs(
+        self,
+        universe: list[str],
+        summary: str,
+        evidence: str,
+        bull_case: str,
+        bear_case: str,
+        run_id: int,
+        regime: str,
+    ) -> None:
+        """Write the PM decision to AQS agent_memory for cross-agent visibility."""
+        try:
+            from src.memory.aqs_writer import write_decision_to_aqs
+
+            # Parse action from summary (best-effort)
+            summary_lower = summary.lower()
+            if any(w in summary_lower for w in ("buy", "long", "enter", "submit")):
+                action = "buy"
+            elif any(w in summary_lower for w in ("sell", "exit", "close")):
+                action = "sell"
+            else:
+                action = "hold"
+
+            # Write one decision record per primary symbol
+            for symbol in universe[:3]:  # top 3 max
+                write_decision_to_aqs(
+                    symbol=symbol,
+                    action=action,
+                    regime=regime,
+                    thesis_summary=summary[:1000],
+                    committee_split={
+                        "evidence_researcher": (evidence or "")[:200],
+                        "bull_researcher": (bull_case or "")[:200],
+                        "bear_researcher": (bear_case or "")[:200],
+                        "portfolio_manager": summary[:200],
+                    },
+                    evidence_summary=evidence[:500],
+                    run_id=f"run-{run_id}",
+                )
+
+            logger.info("[NexusCommittee run %d] Decision written to AQS", run_id)
+        except Exception as exc:
+            logger.warning("AQS write-back failed (non-fatal): %s", exc)
+
+        # ── Phase 5: AQS sync (dual-write path) ──
+        self._sync_decision_to_aqs(summary, universe, regime, run_id)
+
+    # ------------------------------------------------------------------
+    # AQS write-back (second path via aqs_sync)
+    # ------------------------------------------------------------------
+
+    def _sync_decision_to_aqs(
+        self,
+        summary: str,
+        universe: list[str],
+        regime: str,
+        run: int,
+    ) -> None:
+        """Write PM decision and committee summary to AQS lakehouse.
+
+        Best-effort: never crashes the committee if AQS is unavailable.
+        Writes to:
+        - ``agent_memory`` (memory_type='trade_decision')
+        - ``signals`` (source_repo='nexus-trade')
+        """
+        try:
+            from src.memory.aqs_sync import sync_committee_decision, sync_signal
+
+            run_id = f"run{run}_{self.get_datetime().strftime('%Y%m%d_%H%M')}"
+            ts = self.get_datetime().isoformat()
+
+            # Extract primary symbol from universe (first crypto ticker)
+            symbol = universe[0] if universe else "UNKNOWN"
+
+            # Determine action from summary (simple heuristic)
+            summary_lower = summary.lower()
+            if any(w in summary_lower for w in ("buy", "long", "enter", "submitted")):
+                action = "buy"
+            elif any(w in summary_lower for w in ("sell", "exit", "close")):
+                action = "sell"
+            else:
+                action = "hold"
+
+            # Write decision to agent_memory
+            sync_committee_decision({
+                "symbol": symbol,
+                "action": action,
+                "regime": regime,
+                "thesis": summary[:2000],
+                "evidence_summary": (
+                    f"Bull: {(self.vars.last_bull_case or '')[:300]} | "
+                    f"Bear: {(self.vars.last_bear_case or '')[:300]}"
+                ),
+                "committee_split": {
+                    "evidence": (self.vars.last_evidence_pack or "")[:200],
+                    "bull": (self.vars.last_bull_case or "")[:200],
+                    "bear": (self.vars.last_bear_case or "")[:200],
+                    "pm": summary[:200],
+                },
+                "backtest_id": getattr(self, "backtest_id", ""),
+            }, run_id=run_id, timestamp=ts)
+
+            # Write signal to signals table
+            sync_signal({
+                "source": "nexus-trade",
+                "signal_type": "committee_decision",
+                "ticker": symbol,
+                "value": 1.0 if action == "buy" else (-1.0 if action == "sell" else 0.0),
+                "confidence": 0.5,  # Neutral default; PM can refine
+                "regime_context": regime,
+                "metadata_json": json.dumps({
+                    "run": run,
+                    "run_id": run_id,
+                    "universe": universe,
+                    "committee_run_count": run,
+                    "summary": summary[:500],
+                }),
+            })
+
+            logger.info("[NexusCommittee run %d] AQS sync complete", run)
+        except Exception:
+            logger.debug("AQS sync failed (non-critical)", exc_info=True)
 
     # ------------------------------------------------------------------
     # Context builder
@@ -355,7 +522,7 @@ class NexusCommitteeStrategy(Strategy):
         # Try to get regime and memory stats for context
         try:
             from src.tools.regime_tool import detect_regime_tool
-            regime_result = detect_regime_tool(self, lookback=50)
+            regime_result = detect_regime_tool(lookback=50)
             context["current_regime"] = regime_result.get("regime", "unknown")
             context["regime_confidence"] = regime_result.get("confidence", 0.0)
             context["regime_details"] = regime_result
@@ -368,45 +535,48 @@ class NexusCommitteeStrategy(Strategy):
         # Try to get memory stats
         try:
             from src.tools.trade_memory_tool import get_memory_stats_tool
-            mem_stats = get_memory_stats_tool(self)
+            mem_stats = get_memory_stats_tool()
             context["memory_stats"] = mem_stats
         except Exception:
             context["memory_stats"] = {"enabled": False}
 
         # ── Lakehouse intelligence (mode-gated, graceful degradation) ──
         if self._lakehouse_enabled:
-            from src.lakehouse.reader import get_reader
-            lakehouse = get_reader()
-            hc = lakehouse.health_check()
-            if hc.get("connected"):
-                # Pre-fetch regime for all universe tickers
-                lakehouse_regimes = {}
-                for sym in universe:
-                    reg = lakehouse.get_regime(sym)
-                    if reg:
-                        lakehouse_regimes[sym] = reg
-                context["lakehouse_regimes"] = lakehouse_regimes
-                context["lakehouse_available"] = True
-                # Include strategy candidates from pool
-                strats = lakehouse.get_strategy_pool(min_sharpe=1.0, limit=10)
-                if strats:
-                    context["lakehouse_strategy_candidates"] = [
-                        {"name": s.get("name"), "sharpe": s.get("backtest_sharpe"), "status": s.get("status")}
-                        for s in strats[:5]
-                    ]
-                # Include recent failures for awareness
-                failures = lakehouse.get_failures(limit=10)
-                if failures:
-                    context["lakehouse_failures"] = [
-                        {"strategy": f.get("strategy_name"), "reason": f.get("failure_reason", "")[:80]}
-                        for f in failures[:5]
-                    ]
-                logger.debug("Lakehouse context injected: %d regimes, %d strategies, %d failures",
-                             len(lakehouse_regimes), len(strats), len(failures))
-            else:
+            try:
+                from src.lakehouse.reader import get_reader
+                lakehouse = get_reader()
+                hc = lakehouse.health_check()
+                if hc.get("connected"):
+                    # Pre-fetch regime for all universe tickers
+                    lakehouse_regimes = {}
+                    for sym in universe:
+                        reg = lakehouse.get_regime(sym)
+                        if reg:
+                            lakehouse_regimes[sym] = reg
+                    context["lakehouse_regimes"] = lakehouse_regimes
+                    context["lakehouse_available"] = True
+                    # Include strategy candidates from pool
+                    strats = lakehouse.get_strategy_pool(min_composite=49.0, limit=10)
+                    if strats:
+                        context["lakehouse_strategy_candidates"] = [
+                            {"name": s.get("strategy_name"), "sharpe": s.get("sharpe"),
+                             "composite": s.get("composite_score"), "status": s.get("status"),
+                             "ticker": s.get("ticker")}
+                            for s in strats[:5]
+                        ]
+                    # Include recent failures for awareness
+                    failures = lakehouse.get_failures(limit=10)
+                    if failures:
+                        context["lakehouse_failures"] = [
+                            {"strategy": f.get("strategy_name"), "reason": f.get("failure_reason", "")[:80]}
+                            for f in failures[:5]
+                        ]
+                    logger.debug("Lakehouse context injected: %d regimes, %d strategies, %d failures",
+                                 len(lakehouse_regimes), len(strats), len(failures))
+                else:
+                    context["lakehouse_available"] = False
+            except Exception:
                 context["lakehouse_available"] = False
-        except Exception:
-            context["lakehouse_available"] = False
 
         return context
 
@@ -541,6 +711,10 @@ Before trading:
    call remember_lesson to store them.
 9. **If lakehouse tools are available**, use lakehouse_write_lesson to
    persist important lessons to the ecosystem experience bank for cross-project learning.
+10. **Use query_stratforge_strategies** to discover best-fit strategies from
+    the StratForge lakehouse. Query by symbol and min composite score to find
+    validated strategies with strong walk-forward Sharpe ratios. Use this to
+    select which strategy to load for the current market conditions.
 
 Use these memory tools:
 - **query_trade_memory** — check what history tells us about similar setups
