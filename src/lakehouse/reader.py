@@ -125,14 +125,30 @@ class NexusLakehouseReader:
     def get_regime(self, ticker: str) -> dict[str, Any]:
         """Get latest composite regime for *ticker* from v_nexus_regime.
 
+        When ``NEXUS_REGIME_CHAMPION_ONLY=1``, queries ``v_nexus_regime_champion``
+        instead — preferring the ``closed_loop`` detector for BTC-USDT, falling
+        back to ``composite``/``ensemble`` for all other tickers.  This removes
+        ``ml_classifier`` (TESTBTC debug noise) from the result stream.
+
         The curated view filters to composite/ensemble detector outputs only.
         """
+        if os.environ.get("NEXUS_REGIME_CHAMPION_ONLY", "0") == "1":
+            return self._query_one(
+                "SELECT * FROM v_nexus_regime_champion WHERE ticker = ?", [ticker]
+            ) or {}
         return self._query_one(
             "SELECT * FROM v_nexus_regime WHERE ticker = ?", [ticker]
         ) or {}
 
     def get_all_regimes(self) -> list[dict[str, Any]]:
-        """Get latest composite regime for every tracked ticker."""
+        """Get latest composite regime for every tracked ticker.
+
+        When ``NEXUS_REGIME_CHAMPION_ONLY=1``, returns ``v_nexus_regime_champion``
+        instead — preferring ``closed_loop`` for BTC-USDT and ``composite`` for
+        all other tickers.
+        """
+        if os.environ.get("NEXUS_REGIME_CHAMPION_ONLY", "0") == "1":
+            return self._query("SELECT * FROM v_nexus_regime_champion")
         return self._query("SELECT * FROM v_nexus_regime")
 
     # ── Signals ──────────────────────────────────────────────────────
@@ -460,6 +476,7 @@ class NexusLakehouseReader:
         result["connected"] = True
         for vname in [
             "v_nexus_regime",
+            "v_nexus_regime_champion",
             "v_nexus_signal_feed",
             "v_nexus_factors",
             "v_nexus_strategy_pool",
