@@ -2,15 +2,17 @@
 # Installed in the lumibot venv: ~/development/trading-bots/lumibot/venv/
 # Update this file when adding new top-level dependencies.
 
-# Vector memory (LanceDB local embedded store)
-# Required by src/memory/nexus_vector_memory.py
-# Without this, Nexus vector memory falls back to graceful degradation
-# (no vector search, no similarity recall).
-lancedb>=0.20.0
-
-# Local embeddings (Qwen3-Embedding-0.6B, 1024-dim)
-# Replaces Gemini API. Auto-detects GPU via sentence-transformers.
-sentence-transformers>=2.7.0
+# ---------------------------------------------------------------
+# Vector memory stack (lancedb + sentence-transformers + Qwen3) is
+# INTENTIONALLY NOT listed here. Those packages live in the AQOS venv
+# and are invoked from nexus-trade via subprocess bridge
+# (src/memory/bridge.py). See AGENTS.md "Vector memory stack" for
+# the full architecture and runtime guards.
+#
+# If you think you need to add lancedb or sentence-transformers here
+# because `import lancedb` fails in the lumibot venv — that is BY
+# DESIGN. Use the subprocess bridge. Do not pip install.
+# ---------------------------------------------------------------
 
 # Already required by lumibot (re-pinned here for standalone nexus-trade use)
 pandas>=2.2.0

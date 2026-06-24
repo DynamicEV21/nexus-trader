@@ -67,6 +67,67 @@ _SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+
+# ----------------------------------------------------------------------
+# DETERMINISTIC GUARD — fail loud at strategy init if lancedb or
+# sentence_transformers were installed into the LUMIBOT venv.
+#
+# The vector memory stack lives in the AQOS venv and is invoked via
+# subprocess bridge (src/memory/bridge.py). If we can import it from the
+# lumibot venv, something has been installed in the wrong place — refuse
+# to start the strategy. See AGENTS.md "Vector memory stack" for context.
+# ----------------------------------------------------------------------
+def _check_vector_memory_venv_isolation(logger_name: str) -> None:
+    """Hard-fail if lancedb or sentence_transformers are importable here.
+
+    These packages belong in the AQOS venv, not the lumibot venv. If they
+    are importable from the current Python, something has been installed
+    in the wrong venv. We log a loud banner and raise so the strategy
+    won't initialize.
+    """
+    forbidden = []
+    try:
+        import lancedb  # noqa: F401
+        forbidden.append("lancedb")
+    except ImportError:
+        pass
+    try:
+        import sentence_transformers  # noqa: F401
+        forbidden.append("sentence_transformers")
+    except ImportError:
+        pass
+    if forbidden:
+        banner_lines = [
+            "",
+            "+--------------------------------------------------------------+",
+            "| FATAL: vector memory stack found in LUMIBOT venv              |",
+            "+--------------------------------------------------------------+",
+            f"| Detected: {', '.join(forbidden):<54}|",
+            "| The vector memory stack (lancedb + sentence_transformers +   |",
+            "| Qwen3-Embedding-0.6B) must live in the AQOS venv. Nexus calls |",
+            "| it via subprocess bridge (src/memory/bridge.py), NOT in-process.|",
+            "|                                                              |",
+            "| If you ran `pip install lancedb sentence_transformers` in the|",
+            "| lumibot venv, UNINSTALL it:                                  |",
+            "|   <lumibot-venv>/bin/pip uninstall -y lancedb sentence_transformers |",
+            "|                                                              |",
+            "| See nexus-trade/AGENTS.md -> 'Vector memory stack'.          |",
+            "+--------------------------------------------------------------+",
+            "",
+        ]
+        banner = "\n".join(banner_lines)
+        logging.getLogger(logger_name).critical(banner)
+        # Also write to stderr in case logging isn't wired yet
+        import sys as _sys
+        print(banner, file=_sys.stderr)
+        raise RuntimeError(
+            "Vector memory stack (lancedb/sentence_transformers) must not be "
+            "installed in the lumibot venv. See banner for fix."
+        )
+
+
+_check_vector_memory_venv_isolation("src.strategies.nexus_committee")
+
 from lumibot.strategies.strategy import Strategy
 
 logger = logging.getLogger(__name__)
@@ -403,8 +464,9 @@ class NexusCommitteeStrategy(Strategy):
                 action = "hold"
 
             # Write one decision record per primary symbol
+            failed_symbols = []
             for symbol in universe[:3]:  # top 3 max
-                write_decision_to_aqs(
+                ok = write_decision_to_aqs(
                     symbol=symbol,
                     action=action,
                     regime=regime,
@@ -418,10 +480,18 @@ class NexusCommitteeStrategy(Strategy):
                     evidence_summary=evidence[:500],
                     run_id=f"run-{run_id}",
                 )
+                if not ok:
+                    failed_symbols.append(symbol)
 
-            logger.info("[NexusCommittee run %d] Decision written to AQS", run_id)
+            if failed_symbols:
+                logger.warning(
+                    "[NexusCommittee run %d] AQS write failed for %d/%d symbols: %s",
+                    run_id, len(failed_symbols), len(universe[:3]), failed_symbols,
+                )
+            else:
+                logger.info("[NexusCommittee run %d] Decision written to AQS", run_id)
         except Exception as exc:
-            logger.warning("AQS write-back failed (non-fatal): %s", exc)
+            logger.error("AQS write-back failed (non-fatal): %s", exc)
 
         # ── Phase 5: AQS sync (dual-write path) ──
         self._sync_decision_to_aqs(summary, universe, regime, run_id)

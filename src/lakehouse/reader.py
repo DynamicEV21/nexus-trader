@@ -34,6 +34,28 @@ _AQOS_SRC = os.path.expanduser("~/development/agentic-quant-os/src")
 if _AQOS_SRC not in sys.path:
     sys.path.insert(0, _AQOS_SRC)
 
+# ---------------------------------------------------------------------------
+# DuckDB → DuckLake redirect (safety net)
+#
+# If the agentic-quant-os ducklake_redirect module is available, import it
+# so that any *accidental* `duckdb.connect(quant.duckdb_path)` calls anywhere
+# in this process are transparently redirected to DuckLake. This is a
+# safety net for the dual-write pipeline: if quant.duckdb ever drifts from
+# DuckLake, a direct file read would return stale data, but a redirected
+# read would always get fresh DuckLake data.
+#
+# This is best-effort. If the import fails (DuckLake not reachable,
+# extensions not installed, etc.), we log a warning and continue with
+# normal file-based duckdb behavior.
+# ---------------------------------------------------------------------------
+try:
+    import ducklake_redirect  # noqa: F401  -- side-effect: monkeypatches duckdb.connect
+    logger.info("ducklake_redirect loaded — quant.duckdb reads will route to DuckLake")
+except Exception as exc:
+    logger.warning(
+        "ducklake_redirect unavailable (%s) — quant.duckdb reads will use file directly", exc
+    )
+
 _DEFAULT_DB_PATH = os.path.expanduser(
     os.environ.get("NEXUS_LAKEHOUSE_PATH", "~/development/agentic-quant-os/data/quant.duckdb")
 )

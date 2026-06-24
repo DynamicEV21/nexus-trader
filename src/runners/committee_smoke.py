@@ -32,6 +32,65 @@ from lumibot.entities import Asset, Data, TradingFee
 logger = logging.getLogger(__name__)
 
 
+# ----------------------------------------------------------------------
+# DETERMINISTIC GUARD — fail loud if lancedb or sentence_transformers
+# were installed into the LUMIBOT venv.
+#
+# Architecture: the vector memory stack (lancedb + sentence_transformers +
+# Qwen3-Embedding-0.6B) lives in the AQOS venv and is invoked from
+# nexus-trade via a subprocess bridge (src/memory/bridge.py). The lumibot
+# venv must stay LIGHT. If something tries to install these packages
+# in the lumibot venv again, this guard fails fast and refuses to run.
+#
+# This is RUNTIME enforcement; the matching docs are in AGENTS.md
+# "Vector memory stack — single source of truth" section.
+# ----------------------------------------------------------------------
+def _check_vector_memory_venv_isolation() -> None:
+    """Hard-fail if lancedb or sentence_transformers are importable here.
+
+    These packages belong in the AQOS venv, not the lumibot venv. If they
+    are importable from the current Python (i.e. this smoke runner's
+    interpreter), something has been installed in the wrong venv.
+    """
+    forbidden = []
+    try:
+        import lancedb  # noqa: F401
+        forbidden.append("lancedb")
+    except ImportError:
+        pass
+    try:
+        import sentence_transformers  # noqa: F401
+        forbidden.append("sentence_transformers")
+    except ImportError:
+        pass
+    if forbidden:
+        banner = (
+            "\n"
+            "+--------------------------------------------------------------+\n"
+            "| FATAL: vector memory stack found in LUMIBOT venv              |\n"
+            "+--------------------------------------------------------------+\n"
+            f"| Detected: {', '.join(forbidden):<54}|\n"
+            "| The vector memory stack (lancedb + sentence_transformers +\n"
+            "| Qwen3-Embedding-0.6B) must live in the AQOS venv. Nexus calls\n"
+            "| it via subprocess bridge (src/memory/bridge.py), NOT in-process.\n"
+            "|\n"
+            "| If you ran `pip install lancedb sentence_transformers` in the\n"
+            "| lumibot venv, UNINSTALL it:\n"
+            "|   <lumibot-venv>/bin/pip uninstall -y lancedb sentence_transformers\n"
+            "|\n"
+            "| See nexus-trade/AGENTS.md -> 'Vector memory stack' for context.\n"
+            "+--------------------------------------------------------------+\n"
+        )
+        print(banner, file=sys.stderr)
+        raise SystemExit(
+            "Vector memory stack (lancedb/sentence_transformers) must not be "
+            "installed in the lumibot venv. See stderr banner for fix."
+        )
+
+
+_check_vector_memory_venv_isolation()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Nexus Committee smoke test (1-day BTC)")
     parser.add_argument("--symbol", default="BTC", help="Ticker symbol (default: BTC)")

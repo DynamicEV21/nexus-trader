@@ -70,6 +70,28 @@ $NEXUS_VENV_AQOS -m src.memory.bridge --strategy Nexus_Trader --dry-run
 # Should show: decisions.jsonl: N read, N unique ready to bridge
 ```
 
+**Runtime guards** (docs alone were not enough — agents kept trying to `pip install sentence-transformers` in the lumibot venv):
+
+Two files run a hard import check at module load and refuse to start if `lancedb` or `sentence_transformers` is importable in the lumibot venv:
+
+| File | Failure mode |
+|---|---|
+| `src/runners/committee_smoke.py` | `SystemExit(1)` with banner — smoke test will not run |
+| `src/strategies/nexus_committee.py` | `RuntimeError` with banner — strategy will not initialize |
+
+**Both guards print a banner naming the forbidden package(s), the correct uninstall command, and a pointer to this section.** Tested 2026-06-24 with a fake `lancedb` injected via `PYTHONPATH` — both guards fire as expected. Clean venv (no `lancedb`/`sentence_transformers`) passes silently.
+
+If a guard fires, the fix is:
+
+```bash
+/home/Zev/development/trading-bots/lumibot/venv/bin/pip uninstall -y lancedb sentence_transformers
+# Then check it's actually gone:
+/home/Zev/development/trading-bots/lumibot/venv/bin/python -c "import lancedb, sentence_transformers" 2>&1
+# Both should be ModuleNotFoundError.
+```
+
+**`requirements.txt` no longer lists `lancedb` or `sentence-transformers`** (commit pending) — the absence is intentional and documented inline. Do not re-add them.
+
 ### Regime Detection — Two Views, Champion by Flag
 
 `quant.duckdb` has TWO regime views:
