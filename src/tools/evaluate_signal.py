@@ -37,7 +37,10 @@ Strategy source code is executed via ``exec()`` in a restricted namespace:
 - **Allowed modules**: ``numpy`` (as ``np``), ``pandas`` (as ``pd``), ``talib``
 - **Blocked modules**: ``os``, ``sys``, ``subprocess``, ``socket``, ``open``
   (builtin), ``importlib``, ``__import__`` is overridden
-- **Timeout**: 10-second wall clock via ``signal.alarm``
+- **Timeout**: 10-second wall clock via ``threading.Timer`` (works in
+  worker threads; ``signal.alarm`` only works in the main thread of the
+  main interpreter and would raise ``ValueError`` when LumiBot's
+  agent-tool executor calls us from a worker thread)
 - **All wrapped in try/except**: errors return a ``hold`` signal with
   ``confidence=0`` and the error message
 
@@ -55,8 +58,8 @@ import hashlib
 import json
 import logging
 import os
-import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -107,8 +110,131 @@ class _TimeoutError(Exception):
     """Raised when strategy execution exceeds the time limit."""
 
 
-def _timeout_handler(signum: int, frame: Any) -> None:
+# Detect whether ``signal.SIGALRM`` is usable (main thread only).
+# In LumiBot's agent-tool executor, evaluate_signal can be called from a
+# worker thread, where ``signal.signal(SIGALRM, ...)`` raises
+# ``ValueError: signal only works in main thread of the main interpreter``.
+# We fall back to ``concurrent.futures`` + ``future.result(timeout=)`` in
+# that case (Python threads cannot actually be killed, but we discard
+# the result and return ``hold`` when the timeout fires).
+import concurrent.futures
+import signal as _signal
+
+_CAN_USE_SIGALRM = True
+try:
+    # Probe: signal.SIGALRM is unavailable on Windows
+    _signal.SIGALRM  # noqa: B018
+    # Probe: try to install a no-op handler to detect thread context
+    _prev = _signal.signal(_signal.SIGALRM, _signal.SIG_DFL)
+    _signal.signal(_signal.SIGALRM, _prev)
+except (AttributeError, ValueError):
+    _CAN_USE_SIGALRM = False
+
+
+def _sigalarm_handler(signum: int, frame: Any) -> None:
     raise _TimeoutError("Strategy execution exceeded 10-second timeout")
+
+
+def _execute_in_sandbox(
+    source_code: str,
+    df: Any,
+    params: dict | None,
+    timeout_s: float,
+) -> tuple[Any, Any]:
+    """Execute strategy ``source_code`` with a wall-clock timeout.
+
+    Uses ``signal.SIGALRM`` when running on the main thread, or
+    ``concurrent.futures.ThreadPoolExecutor`` with ``future.result(timeout=)``
+    when running in a worker thread. Raises :class:`_TimeoutError` on
+    timeout.
+    """
+    def _runner() -> tuple[Any, Any]:
+        # Set up the restricted namespace
+        import numpy as np
+        import pandas as pd
+        import talib
+        import math
+        import statistics
+
+        safe_builtins = {
+            "abs": abs, "min": min, "max": max, "sum": sum, "len": len,
+            "range": range, "enumerate": enumerate, "zip": zip,
+            "int": int, "float": float, "str": str, "bool": bool,
+            "list": list, "dict": dict, "tuple": tuple, "set": set,
+            "sorted": sorted, "reversed": reversed, "any": any, "all": all,
+            "round": round, "isinstance": isinstance, "type": type,
+            "print": print,
+            "None": None, "True": True, "False": False,
+            "ValueError": ValueError, "TypeError": TypeError,
+            "KeyError": KeyError, "IndexError": IndexError,
+            "ZeroDivisionError": ZeroDivisionError,
+            "Exception": Exception, "RuntimeError": RuntimeError,
+            "getattr": getattr, "hasattr": hasattr, "setattr": setattr,
+            "property": property, "staticmethod": staticmethod,
+            "classmethod": classmethod,
+            "__import__": _safe_import,
+            "__name__": "__strategy_sandbox__",
+            "__build_class__": __build_class__,
+        }
+
+        restricted_globals = {
+            "__builtins__": safe_builtins,
+            "np": np,
+            "pd": pd,
+            "talib": talib,
+            "math": math,
+            "statistics": statistics,
+        }
+
+        exec(source_code, restricted_globals)  # noqa: S102
+
+        strategy_fn = None
+        for name in ("strategy", "generate_signal", "run"):
+            if name in restricted_globals and callable(restricted_globals[name]):
+                strategy_fn = restricted_globals[name]
+                break
+
+        if strategy_fn is None:
+            for name, obj in restricted_globals.items():
+                if name.startswith("_"):
+                    continue
+                if callable(obj) and not isinstance(obj, type):
+                    if name != "np" and name != "pd" and name != "talib":
+                        strategy_fn = obj
+                        logger.debug("Auto-detected strategy function: %s", name)
+                        break
+
+        if strategy_fn is None:
+            raise ValueError(
+                "No strategy function found in source code. "
+                "Expected: def strategy(df, params=None) or similar"
+            )
+
+        result = strategy_fn(df, params)
+        return result if isinstance(result, tuple) else (result, None)
+
+    if _CAN_USE_SIGALRM:
+        # Main-thread path: SIGALRM can interrupt exec() cleanly.
+        old_handler = _signal.signal(_signal.SIGALRM, _sigalarm_handler)
+        _signal.alarm(int(timeout_s))
+        try:
+            return _runner()
+        finally:
+            _signal.alarm(0)
+            _signal.signal(_signal.SIGALRM, old_handler)
+
+    # Worker-thread path: run in a future and time it out. Note: Python
+    # threads cannot be force-killed, so the worker thread will keep
+    # running (consuming GIL) after we give up — but we discard the
+    # result and return ``hold`` so the caller isn't blocked.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(_runner)
+        try:
+            return future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError as exc:
+            raise _TimeoutError(
+                f"Strategy execution exceeded {timeout_s:.0f}-second timeout"
+            ) from exc
 
 
 # Modules that are explicitly blocked
@@ -137,89 +263,23 @@ def _safe_import(name: str, *args: Any, **kwargs: Any) -> Any:
 _original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
 
 
-def _execute_strategy(source_code: str, df: Any, params: dict | None = None) -> tuple[Any, Any]:
+def _execute_strategy(
+    source_code: str, df: Any, params: dict | None = None,
+    timeout_s: float = 10.0,
+) -> tuple[Any, Any]:
     """Execute strategy source code in a restricted namespace.
 
     Returns (entries, exits) pd.Series.
 
     Raises on any error (timeout, import violation, runtime error, etc.)
+
+    The timeout is enforced via :data:`_CAN_USE_SIGALRM` heuristic:
+    ``signal.SIGALRM`` when on the main thread (cleanly interrupts
+    ``exec()``), or a thread-pool future with ``result(timeout=)`` when
+    in a worker thread (cannot force-kill, but the result is discarded
+    and a ``hold`` is returned on timeout).
     """
-    # Set up the restricted namespace
-    import numpy as np
-    import pandas as pd
-    import talib
-    import math
-    import statistics
-
-    safe_builtins = {
-        # Basic Python builtins that don't touch I/O
-        "abs": abs, "min": min, "max": max, "sum": sum, "len": len,
-        "range": range, "enumerate": enumerate, "zip": zip,
-        "int": int, "float": float, "str": str, "bool": bool,
-        "list": list, "dict": dict, "tuple": tuple, "set": set,
-        "sorted": sorted, "reversed": reversed, "any": any, "all": all,
-        "round": round, "isinstance": isinstance, "type": type,
-        "print": print,  # Allow print for debugging (goes to logs)
-        "None": None, "True": True, "False": False,
-        "ValueError": ValueError, "TypeError": TypeError,
-        "KeyError": KeyError, "IndexError": IndexError,
-        "ZeroDivisionError": ZeroDivisionError,
-        "Exception": Exception, "RuntimeError": RuntimeError,
-        "getattr": getattr, "hasattr": hasattr, "setattr": setattr,
-        "property": property, "staticmethod": staticmethod,
-        "classmethod": classmethod,
-        "__import__": _safe_import,
-        "__name__": "__strategy_sandbox__",
-        "__build_class__": __build_class__,
-    }
-
-    restricted_globals = {
-        "__builtins__": safe_builtins,
-        "np": np,
-        "pd": pd,
-        "talib": talib,
-        "math": math,
-        "statistics": statistics,
-    }
-
-    # Set up timeout
-    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(10)  # 10 second timeout
-
-    try:
-        # Execute the source code to define the function(s)
-        exec(source_code, restricted_globals)  # noqa: S102
-
-        # Find the strategy function — try common names
-        strategy_fn = None
-        for name in ("strategy", "generate_signal", "run"):
-            if name in restricted_globals and callable(restricted_globals[name]):
-                strategy_fn = restricted_globals[name]
-                break
-
-        if strategy_fn is None:
-            # Look for any function that takes (df, params) or (df)
-            for name, obj in restricted_globals.items():
-                if name.startswith("_"):
-                    continue
-                if callable(obj) and not isinstance(obj, type):
-                    # Check if it looks like a strategy function
-                    if name != "np" and name != "pd" and name != "talib":
-                        strategy_fn = obj
-                        logger.debug("Auto-detected strategy function: %s", name)
-                        break
-
-        if strategy_fn is None:
-            raise ValueError("No strategy function found in source code. "
-                             "Expected: def strategy(df, params=None) or similar")
-
-        # Call the strategy
-        result = strategy_fn(df, params)
-        return result if isinstance(result, tuple) else (result, None)
-
-    finally:
-        signal.alarm(0)  # Cancel timeout
-        signal.signal(signal.SIGALRM, old_handler)
+    return _execute_in_sandbox(source_code, df, params, timeout_s=timeout_s)
 
 
 # ---------------------------------------------------------------------------

@@ -33,44 +33,64 @@ logger = logging.getLogger(__name__)
 
 
 # The 4 nexus curated views that are NOT auto-created in quant.duckdb.
-# Schema mirrors agentic-quant-os/src/schema.py:NEXUS_CURATED_VIEWS.
-NEXUS_CURATED_VIEW_DDL: list[str] = [
-    # 5. Regime-strategy mapping: which strategies historically work in which regimes
-    """
-    CREATE OR REPLACE VIEW v_nexus_regime_strategy_map AS
-    SELECT * FROM regime_strategy_map
-    WHERE sample_count >= 5 AND avg_sharpe > 0
-    ORDER BY avg_sharpe DESC
-    """,
+# Schema mirrors agentic-quant-os/src/schema.py:NEXUS_CURATED_VIEWS, with
+# fallbacks for column name drift between the local quant.duckdb and
+# the DuckLake instance. Each entry is a list of DDL candidates; the
+# migration tries them in order and uses the first that succeeds.
+NEXUS_CURATED_VIEW_DDL: list[list[str]] = [
+    # 5. Regime-strategy mapping: which strategies historically work in which
+    # regimes. Upstream uses sample_count + avg_sharpe; the local table has
+    # n_trades + sharpe_ratio. Try upstream first (DuckLake), fall back to
+    # local names (quant.duckdb).
+    [
+        """
+        CREATE OR REPLACE VIEW v_nexus_regime_strategy_map AS
+        SELECT * FROM regime_strategy_map
+        WHERE sample_count >= 5 AND avg_sharpe > 0
+        ORDER BY avg_sharpe DESC
+        """,
+        """
+        CREATE OR REPLACE VIEW v_nexus_regime_strategy_map AS
+        SELECT * FROM regime_strategy_map
+        WHERE n_trades >= 5 AND sharpe_ratio > 0
+        ORDER BY sharpe_ratio DESC
+        """,
+    ],
     # 6. Catalyst digest — latest catalyst grades
-    """
-    CREATE OR REPLACE VIEW v_nexus_catalyst_digest AS
-    SELECT DISTINCT ON (ticker) *
-    FROM catalyst_grades
-    WHERE score IS NOT NULL
-    ORDER BY ticker, timestamp DESC
-    """,
+    [
+        """
+        CREATE OR REPLACE VIEW v_nexus_catalyst_digest AS
+        SELECT DISTINCT ON (ticker) *
+        FROM catalyst_grades
+        WHERE score IS NOT NULL
+        ORDER BY ticker, timestamp DESC
+        """,
+    ],
     # 7. Failure memory for Nexus preflight checks
-    """
-    CREATE OR REPLACE VIEW v_nexus_failures AS
-    SELECT * FROM failures
-    ORDER BY timestamp DESC
-    """,
+    [
+        """
+        CREATE OR REPLACE VIEW v_nexus_failures AS
+        SELECT * FROM failures
+        ORDER BY timestamp DESC
+        """,
+    ],
     # 8. Experience bank entries from quant projects (not Nexus itself)
-    """
-    CREATE OR REPLACE VIEW v_nexus_experience AS
-    SELECT * FROM experience_bank
-    WHERE source_repo IN (
-        'regime-intelligence', 'alpha-factory',
-        'quant-loop-testnet', 'alpha-lab', 'quant-research-mas'
-    )
-       AND severity IN ('warning', 'critical', 'info')
-    ORDER BY created_at DESC
-    """,
+    [
+        """
+        CREATE OR REPLACE VIEW v_nexus_experience AS
+        SELECT * FROM experience_bank
+        WHERE source_repo IN (
+            'regime-intelligence', 'alpha-factory',
+            'quant-loop-testnet', 'alpha-lab', 'quant-research-mas'
+        )
+           AND severity IN ('warning', 'critical', 'info')
+        ORDER BY created_at DESC
+        """,
+    ],
 ]
 
 
-def ensure_views(con: Any, view_ddl: list[str] | None = None) -> int:
+def ensure_views(con: Any, view_ddl: list[list[str]] | None = None) -> int:
     """Ensure the 4 nexus curated views exist in the given connection.
 
     Idempotent (``CREATE OR REPLACE``). Returns the number of views
@@ -78,12 +98,16 @@ def ensure_views(con: Any, view_ddl: list[str] | None = None) -> int:
     tables don't exist (e.g. on a fresh empty quant.duckdb where the
     tables will be created by the next AQS agent sync).
 
+    Each entry in ``view_ddl`` is a list of DDL candidates; the function
+    tries them in order and uses the first that succeeds (so we can
+    tolerate column-name drift between DuckLake and the local DB).
+
     Parameters
     ----------
     con : duckdb.DuckDBPyConnection
         An open writable DuckDB connection. The function will NOT
         open or close the connection itself.
-    view_ddl : list[str] | None
+    view_ddl : list[list[str]] | None
         Optional override of the DDL list. Defaults to
         :data:`NEXUS_CURATED_VIEW_DDL`.
 
@@ -94,17 +118,23 @@ def ensure_views(con: Any, view_ddl: list[str] | None = None) -> int:
     """
     ddl = view_ddl or NEXUS_CURATED_VIEW_DDL
     created = 0
-    for stmt in ddl:
-        try:
-            con.execute(stmt)
-            created += 1
-        except Exception as exc:
-            # Most likely cause: the underlying table doesn't exist
-            # yet (fresh DB, no AQS sync). Not a fatal error — the
-            # views will be created on the next call after the table
-            # appears. Log and continue.
+    for candidates in ddl:
+        last_exc: Exception | None = None
+        for stmt in candidates:
+            try:
+                con.execute(stmt)
+                created += 1
+                last_exc = None
+                break
+            except Exception as exc:
+                # Try next candidate, or fall through to log
+                last_exc = exc
+        if last_exc is not None:
+            # All candidates failed — likely the underlying table
+            # doesn't exist yet. Not fatal; will retry next call.
             logger.debug(
-                "View migration skipped (table likely missing): %s", exc,
+                "View migration skipped (all %d candidates failed): %s",
+                len(candidates), last_exc,
             )
     if created:
         logger.info(

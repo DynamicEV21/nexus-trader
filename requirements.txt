@@ -1,0 +1,22 @@
+# Nexus Trader Python dependencies
+# Installed in the lumibot venv: ~/development/trading-bots/lumibot/venv/
+# Update this file when adding new top-level dependencies.
+
+# Vector memory (LanceDB local embedded store)
+# Required by src/memory/nexus_vector_memory.py
+# Without this, Nexus vector memory falls back to graceful degradation
+# (no vector search, no similarity recall).
+lancedb>=0.20.0
+
+# Local embeddings (Qwen3-Embedding-0.6B, 1024-dim)
+# Replaces Gemini API. Auto-detects GPU via sentence-transformers.
+sentence-transformers>=2.7.0
+
+# Already required by lumibot (re-pinned here for standalone nexus-trade use)
+pandas>=2.2.0
+numpy>=1.20.0
+duckdb>=1.0.0
+pydantic>=2.0.0
+
+# Optional but useful for analysis
+requests>=2.31.0
