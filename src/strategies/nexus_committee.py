@@ -57,6 +57,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import sys
 from datetime import datetime
 from typing import Any
@@ -500,6 +501,37 @@ class NexusCommitteeStrategy(Strategy):
             logger.info("[NexusCommittee run %d] AQS sync complete", run)
         except Exception:
             logger.debug("AQS sync failed (non-critical)", exc_info=True)
+
+        # ── Phase 6: Auto-invoke LanceDB bridge from aqos venv ──────────
+        # Controlled by NEXUS_BRIDGE_AUTO_SYNC=1 (default 0 = off)
+        # NEXUS_VENV_AQOS must point to the aqos venv python binary.
+        # Failures are logged and ignored — bridge errors must never crash the committee.
+        if os.environ.get("NEXUS_BRIDGE_AUTO_SYNC") == "1":
+            venv_python = os.environ.get("NEXUS_VENV_AQOS", "")
+            if venv_python:
+                try:
+                    result = subprocess.run(
+                        [venv_python, "-m", "src.memory.bridge",
+                         "--strategy", "Nexus_Trader"],
+                        cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                    if result.returncode == 0:
+                        logger.info("[NexusCommittee run %d] Bridge auto-sync completed", run)
+                    else:
+                        logger.warning(
+                            "[NexusCommittee run %d] Bridge auto-sync returned %d: %s",
+                            run, result.returncode, result.stderr[:200],
+                        )
+                except subprocess.TimeoutExpired:
+                    logger.warning("[NexusCommittee run %d] Bridge auto-sync timed out after 300s", run)
+                except Exception as exc:
+                    logger.warning("[NexusCommittee run %d] Bridge auto-sync failed: %s", run, exc)
+            else:
+                logger.debug("NEXUS_VENV_AQOS not set — skipping bridge auto-sync")
 
     # ------------------------------------------------------------------
     # Context builder
