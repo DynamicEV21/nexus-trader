@@ -105,7 +105,7 @@ class NexusLessonRecord(LanceModel):
 
 _DEFAULT_PERSIST_DIR: str = os.environ.get(
     "NEXUS_LANCEDB_DIR",
-    os.path.expanduser("~/agentic-quant-os/data/vectors"),
+    "/home/Zev/development/agentic-quant-os/data/vectors",
 )
 
 

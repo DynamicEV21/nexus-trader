@@ -36,6 +36,33 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Best-effort .env loader (module-level so it runs at import, before any
+# downstream module captures NEXUS_LANCEDB_DIR). Uses a tiny manual parser
+# to avoid adding a python-dotenv dependency. Existing env vars win
+# (setdefault semantics).
+# ---------------------------------------------------------------------------
+
+def _load_nexus_env() -> None:
+    _env_path = Path(__file__).resolve().parents[2] / ".env"
+    if not _env_path.exists():
+        return
+    try:
+        for _line in _env_path.read_text(encoding="utf-8").splitlines():
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _k, _, _v = _line.partition("=")
+            _k, _v = _k.strip(), _v.strip()
+            if " #" in _v:
+                _v = _v.split(" #", 1)[0].strip()
+            _v = _v.strip('"').strip("'")
+            os.environ.setdefault(_k, _v)
+    except OSError:
+        pass
+
+_load_nexus_env()
+
+# ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
 
@@ -65,6 +92,9 @@ class MemoryBridge:
         memory_dir: str | None = None,
         nexus_memory = None,
     ) -> None:
+        # .env loading now happens at module import time (see top of
+        # file), so NEXUS_LANCEDB_DIR is in os.environ before any
+        # downstream module captures its _DEFAULT_PERSIST_DIR.
         self.strategy_name = strategy_name
         self.memory_dir = Path(memory_dir or _DEFAULT_MEMORY_DIR)
         self.strategy_dir = self.memory_dir / strategy_name
