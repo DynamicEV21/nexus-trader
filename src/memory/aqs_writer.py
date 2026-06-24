@@ -139,6 +139,12 @@ class AQSWriter:
         ``NexusLakehouseReader`` already has a read-only connection open
         for this file, the read-only connection blocks our write. We close
         any active reader connection first via ``_close_active_reader()``.
+
+        Also runs the nexus view migration on first connection: ensures
+        the 4 nexus curated views (``v_nexus_*``) exist in quant.duckdb
+        so the reader doesn't log "view does not exist" warnings. The
+        migration is idempotent (CREATE OR REPLACE) and silent if the
+        underlying tables don't exist yet.
         """
         if self._file_con is not None:
             try:
@@ -158,6 +164,13 @@ class AQSWriter:
 
             self._file_con = duckdb.connect(self._quant_db_path, read_only=False)
             logger.debug("quant.duckdb write connection established: %s", self._quant_db_path)
+            # Run view migration on this writable connection (one-shot,
+            # idempotent). Lazy import to avoid circular dep.
+            try:
+                from src.lakehouse.view_migration import ensure_views
+                ensure_views(self._file_con)
+            except Exception as exc:
+                logger.debug("View migration skipped: %s", exc)
         except Exception as exc:
             logger.warning("quant.duckdb connection failed: %s", exc)
             self._file_con = None
@@ -189,6 +202,86 @@ class AQSWriter:
 
     # ── Write helpers ──────────────────────────────────────────────
 
+    def _execute_with_retry(
+        self,
+        con: Any,
+        sql: str,
+        params: list[Any],
+        target: str,
+        reset_fn: Any,
+    ) -> bool:
+        """Execute SQL with one retry on intermittent connection errors.
+
+        Workaround for DuckLake v1.5.3 commit NULL bug and other transient
+        extension errors. On failure, the caller-provided ``reset_fn`` is
+        invoked to drop and recreate the connection before one retry.
+
+        Args:
+            con: Connection object (may be None — caller checks first).
+            sql: Parameterized SQL string.
+            params: SQL parameters.
+            target: Human label (e.g. 'DuckLake', 'quant.duckdb') for logging.
+            reset_fn: Callable that returns a fresh connection (or None)
+                when the existing one is stale.
+
+        Returns:
+            True if the SQL executed successfully (initial OR retry),
+            False otherwise.
+        """
+        if con is None:
+            return False
+        # First attempt
+        try:
+            con.execute(sql, params)
+            return True
+        except Exception as exc:
+            err = str(exc).lower()
+            # Only retry on transient extension / commit errors. Surface
+            # schema/constraint errors immediately — those are real bugs.
+            #
+            # DuckLake commit-NULL signature: error contains BOTH
+            # "commit" and "null" (or "internal error") together.
+            # Plain "NOT NULL" violations must NOT trigger retry.
+            err_l = err.lower()
+            transient = (
+                ("commit" in err_l and "null" in err_l)
+                or "internal error" in err_l
+                or "io error" in err_l
+                or "database is locked" in err_l
+            )
+            if not transient:
+                logger.warning(
+                    "%s write failed (non-transient, no retry): %s",
+                    target, exc,
+                )
+                return False
+            logger.warning(
+                "%s write failed (transient, retrying once): %s",
+                target, exc,
+            )
+            # Retry: reset the connection, then run the same SQL.
+            try:
+                fresh = reset_fn()
+                if fresh is None:
+                    logger.warning(
+                        "%s retry aborted: connection reset returned None",
+                        target,
+                    )
+                    return False
+                fresh.execute(sql, params)
+                logger.info("%s write succeeded on retry", target)
+                # Promote the fresh connection into place for the next call.
+                if target == "DuckLake":
+                    self._ducklake_con = fresh
+                elif target == "quant.duckdb":
+                    self._file_con = fresh
+                return True
+            except Exception as exc2:
+                logger.error(
+                    "%s write failed on retry: %s", target, exc2,
+                )
+                return False
+
     def _write_agent_memory(
         self,
         key: str,
@@ -204,49 +297,84 @@ class AQSWriter:
         value_json = json.dumps(value, default=str)
         success = True
 
-        # DuckLake write
+        delete_sql = (
+            "DELETE FROM agent_memory WHERE agent_name = ? AND key = ?"
+        )
+        delete_params = [self._agent_name, key]
+        insert_sql = """
+            INSERT INTO agent_memory
+                (agent_name, memory_type, key, value_json, created_at, accessed_at, access_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        insert_params = [
+            self._agent_name, memory_type, key, value_json, now, None, 0,
+        ]
+
+        # DuckLake write (with retry-once on transient errors)
         dl = self._get_ducklake()
         if dl is not None:
-            try:
-                dl.execute(
-                    "DELETE FROM agent_memory WHERE agent_name = ? AND key = ?",
-                    [self._agent_name, key],
+            ok_del = self._execute_with_retry(
+                dl, delete_sql, delete_params, "DuckLake",
+                reset_fn=self._reset_ducklake,
+            )
+            if ok_del:
+                ok_ins = self._execute_with_retry(
+                    self._ducklake_con or dl, insert_sql, insert_params,
+                    "DuckLake", reset_fn=self._reset_ducklake,
                 )
-                dl.execute(
-                    """
-                    INSERT INTO agent_memory
-                        (agent_name, memory_type, key, value_json, created_at, accessed_at, access_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [self._agent_name, memory_type, key, value_json, now, None, 0],
-                )
-                logger.debug("DuckLake agent_memory write OK: %s", key)
-            except Exception as exc:
-                logger.warning("DuckLake agent_memory write failed: %s", exc)
+                if not ok_ins:
+                    success = False
+            else:
                 success = False
+            if success:
+                logger.debug("DuckLake agent_memory write OK: %s", key)
 
-        # quant.duckdb write
+        # quant.duckdb write (with retry-once on transient errors)
         fc = self._get_file_con()
         if fc is not None:
-            try:
-                fc.execute(
-                    "DELETE FROM agent_memory WHERE agent_name = ? AND key = ?",
-                    [self._agent_name, key],
+            ok_del = self._execute_with_retry(
+                fc, delete_sql, delete_params, "quant.duckdb",
+                reset_fn=self._reset_file,
+            )
+            if ok_del:
+                ok_ins = self._execute_with_retry(
+                    self._file_con or fc, insert_sql, insert_params,
+                    "quant.duckdb", reset_fn=self._reset_file,
                 )
-                fc.execute(
-                    """
-                    INSERT INTO agent_memory
-                        (agent_name, memory_type, key, value_json, created_at, accessed_at, access_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [self._agent_name, memory_type, key, value_json, now, None, 0],
-                )
-                logger.debug("quant.duckdb agent_memory write OK: %s", key)
-            except Exception as exc:
-                logger.warning("quant.duckdb agent_memory write failed: %s", exc)
+                if not ok_ins:
+                    success = False
+            else:
                 success = False
+            if success:
+                logger.debug("quant.duckdb agent_memory write OK: %s", key)
 
         return success
+
+    def _reset_ducklake(self) -> Any:
+        """Drop the cached DuckLake connection and rebuild it."""
+        try:
+            if self._ducklake_con is not None:
+                try:
+                    self._ducklake_con.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._ducklake_con = None
+        return self._get_ducklake()
+
+    def _reset_file(self) -> Any:
+        """Drop the cached quant.duckdb connection and rebuild it."""
+        try:
+            if self._file_con is not None:
+                try:
+                    self._file_con.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._file_con = None
+        return self._get_file_con()
 
     def _write_experience(
         self,
@@ -285,18 +413,16 @@ class AQSWriter:
 
         dl = self._get_ducklake()
         if dl is not None:
-            try:
-                dl.execute(sql, params)
-            except Exception as exc:
-                logger.warning("DuckLake experience_bank write failed: %s", exc)
+            if not self._execute_with_retry(
+                dl, sql, params, "DuckLake", reset_fn=self._reset_ducklake,
+            ):
                 success = False
 
         fc = self._get_file_con()
         if fc is not None:
-            try:
-                fc.execute(sql, params)
-            except Exception as exc:
-                logger.warning("quant.duckdb experience_bank write failed: %s", exc)
+            if not self._execute_with_retry(
+                fc, sql, params, "quant.duckdb", reset_fn=self._reset_file,
+            ):
                 success = False
 
         return eid if success else None
@@ -331,18 +457,16 @@ class AQSWriter:
 
         dl = self._get_ducklake()
         if dl is not None:
-            try:
-                dl.execute(sql, params)
-            except Exception as exc:
-                logger.warning("DuckLake signal write failed: %s", exc)
+            if not self._execute_with_retry(
+                dl, sql, params, "DuckLake", reset_fn=self._reset_ducklake,
+            ):
                 success = False
 
         fc = self._get_file_con()
         if fc is not None:
-            try:
-                fc.execute(sql, params)
-            except Exception as exc:
-                logger.warning("quant.duckdb signal write failed: %s", exc)
+            if not self._execute_with_retry(
+                fc, sql, params, "quant.duckdb", reset_fn=self._reset_file,
+            ):
                 success = False
 
         return sid if success else None
