@@ -11,7 +11,7 @@ agent tools that receive ``self`` (the strategy instance).
 
 Requirements
 ------------
-* ``GOOGLE_API_KEY`` environment variable for embeddings.
+* ``sentence-transformers`` with ``Qwen/Qwen3-Embedding-0.6B`` (local embeddings)
 * LanceDB database at ``NEXUS_LANCEDB_DIR`` or default location.
 """
 
@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 
 def query_trade_memory_tool(
-    self,
     query: str,
     symbol: str = "",
     regime: str = "",
@@ -68,7 +67,7 @@ def query_trade_memory_tool(
                 "relevant_lessons": [],
                 "context_prompt": "",
                 "total_results": 0,
-                "warning": "Vector memory is disabled (GOOGLE_API_KEY not set or LanceDB unavailable)",
+                "warning": "Vector memory is disabled (embedding model not available or LanceDB unavailable)",
             }
 
         decisions = nexus.search_similar_decisions(
@@ -111,7 +110,6 @@ def query_trade_memory_tool(
 
 
 def remember_decision_tool(
-    self,
     symbol: str,
     action: str,
     thesis_summary: str,
@@ -149,7 +147,10 @@ def remember_decision_tool(
                 "warning": "Vector memory is disabled",
             }
 
-        timestamp = self.get_datetime().isoformat() if hasattr(self, "get_datetime") else ""
+        from src.tools._strategy_context import get_strategy
+
+        strategy = get_strategy()
+        timestamp = strategy.get_datetime().isoformat() if strategy and hasattr(strategy, "get_datetime") else ""
         decision_id = f"decision_{timestamp}_{symbol}"
 
         decision = {
@@ -176,7 +177,6 @@ def remember_decision_tool(
 
 
 def remember_lesson_tool(
-    self,
     text: str,
     category: str = "insight",
     severity: str = "info",
@@ -213,7 +213,10 @@ def remember_lesson_tool(
                 "warning": "Vector memory is disabled",
             }
 
-        timestamp = self.get_datetime().isoformat() if hasattr(self, "get_datetime") else ""
+        from src.tools._strategy_context import get_strategy
+
+        strategy = get_strategy()
+        timestamp = strategy.get_datetime().isoformat() if strategy and hasattr(strategy, "get_datetime") else ""
 
         # Parse tags JSON string
         try:
@@ -247,7 +250,7 @@ def remember_lesson_tool(
         return {"stored": False, "lesson_id": "", "error": str(exc)}
 
 
-def get_memory_stats_tool(self) -> dict[str, Any]:
+def get_memory_stats_tool() -> dict[str, Any]:
     """Get statistics about the Nexus Trader vector memory bank.
 
     Returns counts of stored decisions and lessons, and whether the

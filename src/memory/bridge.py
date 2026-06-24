@@ -33,8 +33,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .nexus_vector_memory import NexusVectorMemory, get_nexus_memory
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -57,7 +55,7 @@ class MemoryBridge:
     memory_dir : str | None
         Root directory for LumiBot memory files.  Defaults to
         ``~/.lumibot/memory/`` via ``NEXUS_MEMORY_DIR`` env var.
-    nexus_memory : NexusVectorMemory | None
+    nexus_memory : Any | None
         Pre-existing vector memory instance.  Created lazily if None.
     """
 
@@ -65,7 +63,7 @@ class MemoryBridge:
         self,
         strategy_name: str = "Nexus_Trader",
         memory_dir: str | None = None,
-        nexus_memory: NexusVectorMemory | None = None,
+        nexus_memory = None,
     ) -> None:
         self.strategy_name = strategy_name
         self.memory_dir = Path(memory_dir or _DEFAULT_MEMORY_DIR)
@@ -73,9 +71,10 @@ class MemoryBridge:
         self._nexus_memory = nexus_memory
 
     @property
-    def nexus_memory(self) -> NexusVectorMemory:
+    def nexus_memory(self):
         """Lazy-initialized NexusVectorMemory instance."""
         if self._nexus_memory is None:
+            from .nexus_vector_memory import get_nexus_memory
             self._nexus_memory = get_nexus_memory()
         return self._nexus_memory
 

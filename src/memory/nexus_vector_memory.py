@@ -20,8 +20,8 @@ Key design principles
 Technology
 ----------
 * Vector store : LanceDB (local, embedded, file-based)
-* Embeddings   : ``models/gemini-embedding-001`` (3072-dim)
-* API key      : ``GOOGLE_API_KEY`` environment variable
+* Embeddings   : ``Qwen/Qwen3-Embedding-0.6B`` (1024-dim) via sentence-transformers
+* No API key required — runs entirely locally on GPU (auto-detected)
 """
 
 from __future__ import annotations
@@ -30,12 +30,19 @@ import json
 import logging
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
-import lancedb
-from lancedb.pydantic import LanceModel, Vector
+try:
+    import lancedb  # type: ignore
+    from lancedb.pydantic import LanceModel, Vector  # type: ignore
+    _LANCEDB_AVAILABLE = True
+except ImportError:
+    lancedb = None  # type: ignore
+    LanceModel = object  # type: ignore
+    Vector = lambda *a, **kw: None  # type: ignore
+    _LANCEDB_AVAILABLE = False
+
 from pydantic import Field
 
 logger = logging.getLogger(__name__)
@@ -52,14 +59,17 @@ if _AQOS_PATH not in sys.path:
 # LanceDB Pydantic schemas
 # ---------------------------------------------------------------------------
 
-EMBEDDING_DIM: int = 3072  # gemini-embedding-001 output dimensionality
+EMBEDDING_DIM: int = 1024  # Qwen3-Embedding-0.6B output dimensionality
+
+# Default model — overridable via NEXUS_EMBEDDING_MODEL env var
+EMBEDDING_MODEL: str = os.getenv("NEXUS_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B")
 
 
 class NexusDecisionRecord(LanceModel):
     """LanceDB row schema for a Nexus Trader trade decision."""
 
     id: str = Field(description="Unique key: decision_{timestamp}_{symbol}")
-    vector: Vector(EMBEDDING_DIM) = Field(description="Gemini embedding of decision DNA")  # type: ignore[valid-type]
+    vector: Vector(EMBEDDING_DIM) = Field(description="Qwen3 embedding of decision DNA")  # type: ignore[valid-type]
     text: str = Field(description="Decision DNA string that was embedded")
     symbol: str
     action: str = Field(description="buy, sell, or hold")
@@ -77,7 +87,7 @@ class NexusLessonRecord(LanceModel):
     """LanceDB row schema for a lesson learned from trading experience."""
 
     id: str = Field(description="Unique key: lesson_{timestamp}_{hash}")
-    vector: Vector(EMBEDDING_DIM) = Field(description="Gemini embedding of lesson text")  # type: ignore[valid-type]
+    vector: Vector(EMBEDDING_DIM) = Field(description="Qwen3 embedding of lesson text")  # type: ignore[valid-type]
     text: str = Field(description="Lesson text that was embedded")
     symbol: str = ""
     regime: str = ""
@@ -98,9 +108,6 @@ _DEFAULT_PERSIST_DIR: str = os.environ.get(
     os.path.expanduser("~/agentic-quant-os/data/vectors"),
 )
 
-_MAX_RETRIES: int = 3
-_BASE_BACKOFF_SECONDS: float = 1.0
-
 
 # ---------------------------------------------------------------------------
 # NexusVectorMemory
@@ -108,7 +115,7 @@ _BASE_BACKOFF_SECONDS: float = 1.0
 
 
 class NexusVectorMemory:
-    """Nexus Trader-specific vector memory backed by LanceDB + Gemini embeddings.
+    """Nexus Trader-specific vector memory backed by LanceDB + local Qwen3 embeddings.
 
     Uses the same LanceDB directory as agentic-quant-os but with
     dedicated table names ``nexus_decisions`` and ``nexus_lessons``.
@@ -118,40 +125,26 @@ class NexusVectorMemory:
     persist_dir : str | None
         Directory for the LanceDB database.  Defaults to
         ``NEXUS_LANCEDB_DIR`` or ``~/agentic-quant-os/data/vectors``.
+    model_name : str | None
+        HuggingFace model name for sentence-transformers.
+        Defaults to ``Qwen/Qwen3-Embedding-0.6B``.
     """
 
-    def __init__(self, persist_dir: str | None = None) -> None:
+    def __init__(self, persist_dir: str | None = None, model_name: str | None = None) -> None:
         self._persist_dir = persist_dir or _DEFAULT_PERSIST_DIR
         self._decisions_table_name = "nexus_decisions"
         self._lessons_table_name = "nexus_lessons"
 
         # Lazy-initialized
-        self._db: lancedb.DBConnection | None = None
-        self._decisions_table: lancedb.table.Table | None = None
-        self._lessons_table: lancedb.table.Table | None = None
-        self._genai_client: Any | None = None
+        self._db = None
+        self._decisions_table = None
+        self._lessons_table = None
+        self._model_name = model_name or EMBEDDING_MODEL
+        self._model: Any | None = None
 
-        # Auto-load GOOGLE_API_KEY from env or Hermes profile
-        if not os.getenv("GOOGLE_API_KEY"):
-            for candidate in [
-                Path.home() / ".hermes" / "profiles" / "hermcules" / ".env",
-                Path.home() / ".hermes" / ".env",
-            ]:
-                if candidate.is_file():
-                    for line in candidate.read_text().splitlines():
-                        if line.startswith("GOOGLE_API_KEY=") and not line.startswith("#"):
-                            os.environ["GOOGLE_API_KEY"] = line.split("=", 1)[1].strip()
-                            break
-                    if os.getenv("GOOGLE_API_KEY"):
-                        break
-
-        self._api_key: str | None = os.getenv("GOOGLE_API_KEY")
-        self.enabled: bool = bool(self._api_key)
-        if not self._api_key:
-            logger.warning(
-                "GOOGLE_API_KEY not set — Nexus vector memory disabled. "
-                "Set the environment variable to enable experience banking."
-            )
+        # Always enabled — no API key needed for local embeddings.
+        # Will degrade to disabled if model fails to load.
+        self.enabled: bool = True
 
     # ------------------------------------------------------------------
     # Internal lazy initializers
@@ -159,6 +152,11 @@ class NexusVectorMemory:
 
     def _ensure_db(self) -> None:
         """Open (or create) the LanceDB connection and both tables."""
+        if not _LANCEDB_AVAILABLE:
+            logger.debug("lancedb not installed — vector memory disabled")
+            self.enabled = False
+            return
+
         if self._db is not None:
             return
 
@@ -202,20 +200,25 @@ class NexusVectorMemory:
             )
             self.enabled = False
 
-    def _ensure_genai_client(self) -> None:
-        """Create the Google GenAI client (one-time)."""
-        if self._genai_client is not None:
+    def _ensure_model(self) -> None:
+        """Load the SentenceTransformer model (one-time, lazy)."""
+        if self._model is not None:
             return
 
         try:
-            from google import genai  # type: ignore[import-untyped]
+            from sentence_transformers import SentenceTransformer  # type: ignore[import-untyped]
 
-            self._genai_client = genai.Client(api_key=self._api_key)
-            logger.debug("Google GenAI client initialized for Nexus memory")
+            logger.info("Loading embedding model: %s", self._model_name)
+            self._model = SentenceTransformer(self._model_name)
+            logger.info(
+                "Embedding model loaded (device=%s, dim=%d)",
+                self._model.device,
+                self.get_embedding_dim(),
+            )
         except Exception:
             logger.exception(
-                "Failed to initialize Google GenAI client — "
-                "Nexus embedding operations will be skipped"
+                "Failed to load embedding model %s — Nexus vector memory disabled",
+                self._model_name,
             )
             self.enabled = False
 
@@ -223,116 +226,55 @@ class NexusVectorMemory:
     # Embedding helpers
     # ------------------------------------------------------------------
 
-    def _get_embedding(
-        self,
-        text: str,
-        task_type: str = "retrieval_document",
-    ) -> list[float]:
-        """Call ``gemini-embedding-001`` with retry and exponential back-off."""
-        if not self.enabled:
-            return []
-
-        self._ensure_genai_client()
-        if not self.enabled:
-            return []
-
-        from google.genai import types as genai_types  # type: ignore[import-untyped]
-
-        for attempt in range(1, _MAX_RETRIES + 1):
+    def get_embedding_dim(self) -> int:
+        """Return the actual embedding dimension of the loaded model."""
+        if self._model is not None:
             try:
-                assert self._genai_client is not None
-                response = self._genai_client.models.embed_content(
-                    model="models/gemini-embedding-001",
-                    contents=text,
-                    config=genai_types.EmbedContentConfig(task_type=task_type),
-                )
-                if response.embeddings:
-                    values: list[float] = response.embeddings[0].values  # type: ignore[union-attr]
-                    if values:
-                        return list(values)
-                logger.warning(
-                    "Gemini returned empty embedding (attempt %d/%d)",
-                    attempt,
-                    _MAX_RETRIES,
-                )
-            except Exception as exc:
-                exc_str = str(exc).lower()
-                if any(kw in exc_str for kw in ("401", "403", "permission", "invalid api key")):
-                    logger.error(
-                        "Gemini auth error (won't retry): %s — disabling Nexus memory",
-                        exc,
-                    )
-                    self.enabled = False
-                    return []
+                return self._model.get_embedding_dimension()
+            except Exception:
+                pass
+        return EMBEDDING_DIM
 
-                logger.warning(
-                    "Embedding API error on attempt %d/%d: %s",
-                    attempt,
-                    _MAX_RETRIES,
-                    exc,
-                )
-                if attempt < _MAX_RETRIES:
-                    backoff = _BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                    time.sleep(backoff)
-                else:
-                    logger.error(
-                        "All %d embedding attempts failed for text starting "
-                        "with %.80s — skipping",
-                        _MAX_RETRIES,
-                        text,
-                    )
+    def _get_embedding(self, text: str) -> list[float]:
+        """Embed a single text string using the local model."""
+        if not self.enabled:
+            return []
 
-        return []
+        self._ensure_model()
+        if not self.enabled or self._model is None:
+            return []
 
-    def _batch_embed(
-        self,
-        texts: list[str],
-        task_type: str = "retrieval_document",
-    ) -> list[list[float]]:
-        """Embed multiple texts in a single API call with retry logic."""
+        try:
+            embedding = self._model.encode(
+                text,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            return embedding.tolist()
+        except Exception:
+            logger.exception("Failed to embed text: %.80s", text)
+            return []
+
+    def _batch_embed(self, texts: list[str], batch_size: int = 256) -> list[list[float]]:
+        """Embed multiple texts using the local model in batches."""
         if not self.enabled or not texts:
             return [[] for _ in texts]
 
-        self._ensure_genai_client()
+        self._ensure_model()
         if not self.enabled:
             return [[] for _ in texts]
 
-        from google.genai import types as genai_types  # type: ignore[import-untyped]
-
-        for attempt in range(1, _MAX_RETRIES + 1):
-            try:
-                assert self._genai_client is not None
-                response = self._genai_client.models.embed_content(
-                    model="models/gemini-embedding-001",
-                    contents=texts,
-                    config=genai_types.EmbedContentConfig(task_type=task_type),
-                )
-                if response.embeddings:
-                    return [list(e.values) for e in response.embeddings]  # type: ignore[union-attr]
-            except Exception as exc:
-                exc_str = str(exc).lower()
-                if any(kw in exc_str for kw in ("401", "403", "permission", "invalid api key")):
-                    logger.error("Gemini auth error (won't retry): %s", exc)
-                    self.enabled = False
-                    return [[] for _ in texts]
-
-                is_rate_limit = any(kw in exc_str for kw in ("429", "quota", "resource_exhausted"))
-                if is_rate_limit and attempt == 1:
-                    logger.warning("Rate limited. Waiting 65s for quota reset...")
-                    time.sleep(65.0)
-                    continue
-                elif is_rate_limit:
-                    logger.warning("Rate limited after retry. Giving up on this batch.")
-                    return [[] for _ in texts]
-
-                logger.warning(
-                    "Batch embed API error on attempt %d/%d: %s",
-                    attempt, _MAX_RETRIES, exc,
-                )
-                if attempt < _MAX_RETRIES:
-                    time.sleep(_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
-
-        return [[] for _ in texts]
+        try:
+            embeddings = self._model.encode(
+                texts,
+                batch_size=batch_size,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            return [e.tolist() for e in embeddings]
+        except Exception:
+            logger.exception("Failed to batch embed %d texts", len(texts))
+            return [[] for _ in texts]
 
     # ------------------------------------------------------------------
     # Decision DNA builder
@@ -393,7 +335,7 @@ class NexusVectorMemory:
                 return False
 
             dna = self._build_decision_dna(decision)
-            vector = self._get_embedding(dna, task_type="retrieval_document")
+            vector = self._get_embedding(dna)
             if not vector:
                 logger.warning(
                     "Skipping decision %s — no embedding produced",
@@ -455,7 +397,7 @@ class NexusVectorMemory:
             Each dict must have: ``id``, ``symbol``, ``action``,
             ``regime``, ``timestamp``.
         batch_size : int
-            Number of texts per Gemini API call (max 100).
+            Number of decisions per batch for embedding.
 
         Returns
         -------
@@ -485,8 +427,6 @@ class NexusVectorMemory:
         except Exception:
             logger.warning("Could not pre-load existing decision IDs; will try upserts")
 
-        api_calls = 0
-
         for batch_start in range(0, len(decisions), batch_size):
             batch = decisions[batch_start : batch_start + batch_size]
 
@@ -510,29 +450,12 @@ class NexusVectorMemory:
             if not dna_strings:
                 continue
 
-            # Rate limit between batches
-            if api_calls > 0:
-                if api_calls % 15 == 0:
-                    time.sleep(1.0)
-                else:
-                    time.sleep(0.1)
-
-            api_calls += 1
-
             # Batch embed
             try:
-                vectors = self._batch_embed(dna_strings, task_type="retrieval_document")
+                vectors = self._batch_embed(dna_strings)
             except Exception:
                 logger.exception("Batch embed failed for decisions at offset %d", batch_start)
                 vectors = [[] for _ in dna_strings]
-
-            all_failed = all(not v for v in vectors) if vectors else True
-            if all_failed and dna_strings:
-                logger.warning(
-                    "All embeddings failed for decision batch at offset %d — cooling down 65s",
-                    batch_start,
-                )
-                time.sleep(65.0)
 
             # Build and store records
             records_to_add: list[dict[str, Any]] = []
@@ -619,7 +542,7 @@ class NexusVectorMemory:
             if not self.enabled or self._decisions_table is None:
                 return []
 
-            query_vector = self._get_embedding(query_text, task_type="retrieval_query")
+            query_vector = self._get_embedding(query_text)
             if not query_vector:
                 return []
 
@@ -682,7 +605,7 @@ class NexusVectorMemory:
                 logger.warning("Skipping lesson with empty text")
                 return False
 
-            vector = self._get_embedding(text, task_type="retrieval_document")
+            vector = self._get_embedding(text)
             if not vector:
                 logger.warning("Skipping lesson %s — no embedding produced", lesson.get("id", "?"))
                 return False
@@ -756,7 +679,7 @@ class NexusVectorMemory:
             if not self.enabled or self._lessons_table is None:
                 return []
 
-            query_vector = self._get_embedding(query_text, task_type="retrieval_query")
+            query_vector = self._get_embedding(query_text)
             if not query_vector:
                 return []
 

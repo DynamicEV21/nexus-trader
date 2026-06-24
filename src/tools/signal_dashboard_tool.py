@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 
 def signal_dashboard_tool(
-    self,
     symbol: str,
     lookback: int = 100,
     ma_periods: str = "20,50,200",
@@ -64,8 +63,14 @@ def signal_dashboard_tool(
         - **risk_recommendation** (str) — 'risk_on', 'risk_off', 'neutral'
         - **summary** (str) — human-readable technical summary
     """
+    from src.tools._strategy_context import get_strategy
+
+    strategy = get_strategy()
+    if strategy is None:
+        return {"symbol": symbol, "error": "No strategy registered"}
+
     try:
-        df = self.get_historical_prices(symbol, length=lookback, timestep="day")
+        df = strategy.get_historical_prices(symbol, length=lookback, timestep="day")
         if df is None:
             return {"symbol": symbol, "error": "No price data available"}
 

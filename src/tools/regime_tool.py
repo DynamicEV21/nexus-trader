@@ -30,7 +30,7 @@ if _CRABQUANT_PATH not in sys.path:
 logger = logging.getLogger(__name__)
 
 
-def detect_regime_tool(self, lookback: int = 50) -> dict[str, Any]:
+def detect_regime_tool(lookback: int = 50) -> dict[str, Any]:
     """Detect the current market regime using SPY + VIX data.
 
     Calls CrabQuant's ``detect_regime()``, which uses SMA slopes,
@@ -58,12 +58,17 @@ def detect_regime_tool(self, lookback: int = 50) -> dict[str, Any]:
         - **roc_20** (float) — 20-bar rate of change
     """
     from crabquant.regime import detect_regime
+    from src.tools._strategy_context import get_strategy
+
+    strategy = get_strategy()
+    if strategy is None:
+        return {"regime": "unknown", "confidence": 0.0, "error": "No strategy registered"}
 
     try:
         # Fetch SPY historical data
-        end = self.get_datetime()
+        end = strategy.get_datetime()
         start = end - timedelta(days=max(lookback * 3, 150))
-        spy_bars = self.get_historical_prices("SPY", length=lookback, timestep="day")
+        spy_bars = strategy.get_historical_prices("SPY", length=lookback, timestep="day")
         if spy_bars is None:
             logger.warning("No SPY price data available — cannot detect regime")
             return {
@@ -84,7 +89,7 @@ def detect_regime_tool(self, lookback: int = 50) -> dict[str, Any]:
         # Fetch VIX data (optional — regime detection handles None gracefully)
         df_vix = None
         try:
-            vix_bars = self.get_historical_prices("VIX", length=lookback, timestep="day")
+            vix_bars = strategy.get_historical_prices("VIX", length=lookback, timestep="day")
             if vix_bars is not None:
                 df_vix = vix_bars.df if hasattr(vix_bars, "df") else vix_bars
         except Exception:

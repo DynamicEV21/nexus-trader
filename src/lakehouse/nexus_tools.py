@@ -36,7 +36,6 @@ def _get_reader():
 # ---------------------------------------------------------------------------
 
 def lakehouse_regime(
-    self,
     ticker: str = "SPY",
 ) -> dict[str, Any]:
     """Get the latest composite market regime for a ticker.
@@ -62,7 +61,6 @@ def lakehouse_regime(
 
 
 def lakehouse_signals(
-    self,
     ticker: str = "",
     min_confidence: float = 0.5,
     limit: int = 20,
@@ -95,7 +93,6 @@ def lakehouse_signals(
 
 
 def lakehouse_factors(
-    self,
     ticker: str = "",
 ) -> dict[str, Any]:
     """Get factor snapshot from the alpha-factory pipeline.
@@ -119,19 +116,22 @@ def lakehouse_factors(
 
 
 def lakehouse_strategy_candidates(
-    self,
     regime: str = "",
-    min_sharpe: float = 1.0,
+    min_composite: float = 49.0,
+    min_sharpe: float = 0.0,
+    ticker: str = "",
     limit: int = 10,
 ) -> dict[str, Any]:
-    """Get promoted strategy candidates filtered by regime and Sharpe.
+    """Get validated crypto strategy candidates from the lakehouse.
 
-    Returns strategies that have been validated and promoted, ranked by
-    risk-adjusted performance.
+    Returns strategies from the corrected ``v_nexus_strategy_pool`` view
+    which reads from ``backtest_results_v2`` (crypto strategies only).
 
     Args:
         regime: Optional regime label filter (blank = all regimes).
-        min_sharpe: Minimum Sharpe ratio threshold.
+        min_composite: Minimum composite score (default 49.0, the WF gate).
+        min_sharpe: Minimum in-sample Sharpe ratio.
+        ticker: Filter by ticker (e.g. 'BTC').
         limit: Max strategies to return.
 
     Returns:
@@ -141,7 +141,9 @@ def lakehouse_strategy_candidates(
         reader = _get_reader()
         strategies = reader.get_strategy_pool(
             regime_label=regime,
+            min_composite=min_composite,
             min_sharpe=min_sharpe,
+            ticker=ticker,
             limit=limit,
         )
         return {"strategies": strategies, "count": len(strategies)}
@@ -151,7 +153,6 @@ def lakehouse_strategy_candidates(
 
 
 def lakehouse_catalyst(
-    self,
     ticker: str,
 ) -> dict[str, Any]:
     """Get catalyst grade for a ticker.
@@ -177,7 +178,6 @@ def lakehouse_catalyst(
 
 
 def lakehouse_experience(
-    self,
     query_type: str = "all",
     ticker: str = "",
     limit: int = 10,
@@ -215,7 +215,6 @@ def lakehouse_experience(
 
 
 def lakehouse_preflight(
-    self,
     strategy_name: str = "",
     ticker: str = "",
 ) -> dict[str, Any]:
@@ -254,7 +253,6 @@ def lakehouse_preflight(
 
 
 def lakehouse_intelligence(
-    self,
     ticker: str,
 ) -> dict[str, Any]:
     """Get FULL intelligence packet for a ticker in one call.
@@ -279,7 +277,6 @@ def lakehouse_intelligence(
 
 
 def lakehouse_write_lesson(
-    self,
     text: str,
     category: str = "insight",
     severity: str = "info",
@@ -312,15 +309,18 @@ def lakehouse_write_lesson(
         except (json.JSONDecodeError, TypeError):
             tags_list = [t.strip() for t in tags.split(",") if t.strip()]
 
+        from src.tools._strategy_context import get_strategy
+
+        strategy = get_strategy()
         timestamp = (
-            self.get_datetime().isoformat()
-            if hasattr(self, "get_datetime")
+            strategy.get_datetime().isoformat()
+            if strategy and hasattr(strategy, "get_datetime")
             else datetime.now(timezone.utc).isoformat()
         )
 
         record = {
             "detail": text,
-            "title": record.get("title", f"Lesson: {category}"),
+            "title": f"Lesson: {category}",
             "category": category,
             "severity": severity,
             "ticker": ticker if ticker else "",
@@ -376,10 +376,11 @@ try:
     LAKEHOUSE_STRATEGY_CANDIDATES = agent_tool(
         name="lakehouse_strategy_candidates",
         description=(
-            "Get promoted strategy candidates filtered by regime and minimum "
-            "Sharpe ratio. Returns validated strategies ranked by risk-adjusted "
-            "performance. Use to find the best strategies for the current "
-            "market regime."
+            "Get validated crypto strategy candidates from the lakehouse. "
+            "Returns strategies from backtest_results_v2 (BTC, ETH, SOL, ALL, MULTI) "
+            "ranked by composite score. All strategies have composite >= 49 "
+            "and status winner or tested. Use to find the best strategies "
+            "for the current market regime."
         ),
     )(lakehouse_strategy_candidates)
 
