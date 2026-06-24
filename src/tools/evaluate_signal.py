@@ -110,25 +110,25 @@ class _TimeoutError(Exception):
     """Raised when strategy execution exceeds the time limit."""
 
 
-# Detect whether ``signal.SIGALRM`` is usable (main thread only).
-# In LumiBot's agent-tool executor, evaluate_signal can be called from a
-# worker thread, where ``signal.signal(SIGALRM, ...)`` raises
-# ``ValueError: signal only works in main thread of the main interpreter``.
-# We fall back to ``concurrent.futures`` + ``future.result(timeout=)`` in
-# that case (Python threads cannot actually be killed, but we discard
-# the result and return ``hold`` when the timeout fires).
+# Detect whether ``signal.SIGALRM`` is usable. The check must run on
+# EVERY call to ``_execute_in_sandbox`` because evaluate_signal may be
+# invoked from a worker thread (LumiBot's agent-tool executor) even
+# though it was imported on the main thread. signal.SIGALRM only works
+# in the main thread of the main interpreter; in a worker thread, the
+# ``signal.signal()`` call raises ``ValueError``.
+#
+# Fallback: ``concurrent.futures.ThreadPoolExecutor`` with
+# ``future.result(timeout=)``. Python threads cannot be force-killed,
+# but we discard the result and return ``hold`` when the timeout fires.
 import concurrent.futures
 import signal as _signal
+import threading as _threading
 
-_CAN_USE_SIGALRM = True
-try:
-    # Probe: signal.SIGALRM is unavailable on Windows
-    _signal.SIGALRM  # noqa: B018
-    # Probe: try to install a no-op handler to detect thread context
-    _prev = _signal.signal(_signal.SIGALRM, _signal.SIG_DFL)
-    _signal.signal(_signal.SIGALRM, _prev)
-except (AttributeError, ValueError):
-    _CAN_USE_SIGALRM = False
+# Track the main-thread identity at import time so we can compare
+# against the current thread on every call. This is the only safe way
+# to know whether SIGALRM will work in the CALLING context.
+_MAIN_THREAD_IDENT = _threading.get_ident()
+_SIGALRM_SUPPORTED = hasattr(_signal, "SIGALRM")
 
 
 def _sigalarm_handler(signum: int, frame: Any) -> None:
@@ -213,7 +213,14 @@ def _execute_in_sandbox(
         result = strategy_fn(df, params)
         return result if isinstance(result, tuple) else (result, None)
 
-    if _CAN_USE_SIGALRM:
+    # Determine at CALL time whether SIGALRM will work. SIGALRM only
+    # works in the main thread of the main interpreter; if we're in a
+    # worker thread (LumiBot agent-tool executor) we fall through to
+    # the thread-pool path.
+    in_main_thread = _threading.get_ident() == _MAIN_THREAD_IDENT
+    can_use_sigalrm = _SIGALRM_SUPPORTED and in_main_thread
+
+    if can_use_sigalrm:
         # Main-thread path: SIGALRM can interrupt exec() cleanly.
         old_handler = _signal.signal(_signal.SIGALRM, _sigalarm_handler)
         _signal.alarm(int(timeout_s))
@@ -227,6 +234,9 @@ def _execute_in_sandbox(
     # threads cannot be force-killed, so the worker thread will keep
     # running (consuming GIL) after we give up — but we discard the
     # result and return ``hold`` so the caller isn't blocked.
+    logger.debug(
+        "evaluate_signal running in worker thread — using thread-pool timeout"
+    )
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         future = ex.submit(_runner)
         try:
@@ -273,11 +283,11 @@ def _execute_strategy(
 
     Raises on any error (timeout, import violation, runtime error, etc.)
 
-    The timeout is enforced via :data:`_CAN_USE_SIGALRM` heuristic:
-    ``signal.SIGALRM`` when on the main thread (cleanly interrupts
-    ``exec()``), or a thread-pool future with ``result(timeout=)`` when
-    in a worker thread (cannot force-kill, but the result is discarded
-    and a ``hold`` is returned on timeout).
+    The timeout is enforced PER CALL by checking whether we're on the
+    main thread: ``signal.SIGALRM`` when on the main thread (cleanly
+    interrupts ``exec()``), or a thread-pool future with
+    ``result(timeout=)`` when in a worker thread (cannot force-kill,
+    but the result is discarded and a ``hold`` is returned on timeout).
     """
     return _execute_in_sandbox(source_code, df, params, timeout_s=timeout_s)
 
