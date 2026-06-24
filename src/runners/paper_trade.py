@@ -186,7 +186,12 @@ def check_credentials(config: dict) -> bool:
 # ─── Single-Asset Paper Trading ────────────────────────────────────────
 
 
-def run_single_asset(asset: str, strategy_name: str, exchange: str = "binance"):
+def run_single_asset(
+    asset: str,
+    strategy_name: str,
+    exchange: str = "binance",
+    telegram_enabled: bool = False,
+):
     """Run paper trading for a single asset/strategy pair."""
     from lumibot.brokers import Ccxt
     from strategies.live_adapter import LiveStratForgeAdapter
@@ -226,6 +231,9 @@ def run_single_asset(asset: str, strategy_name: str, exchange: str = "binance"):
             "max_drawdown_pct": 15.0,
             "use_atr_stop": True,
             "atr_multiplier": 2.0,
+            # Telegram notifications — requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+            # in nexus-trade/.env or lumibot venv. Default OFF. Pass --telegram to enable.
+            "telegram_enabled": telegram_enabled,
         },
     )
 
@@ -295,6 +303,11 @@ def main():
         "--timestep", type=str, default=DEFAULT_TIMESTEP,
         help="Bar timestep (e.g. '4H', '1D') — LumiBot format, not '4 hour'",
     )
+    parser.add_argument(
+        "--telegram", action="store_true",
+        help="Enable Telegram notifications (requires TELEGRAM_BOT_TOKEN and "
+             "TELEGRAM_CHAT_ID in env)",
+    )
     args = parser.parse_args()
 
     if args.portfolio:
@@ -304,7 +317,12 @@ def main():
     if not args.asset or not args.strategy:
         parser.error("--asset and --strategy are required (or use --portfolio)")
 
-    run_single_asset(args.asset, args.strategy, exchange=args.exchange)
+    run_single_asset(
+        args.asset,
+        args.strategy,
+        exchange=args.exchange,
+        telegram_enabled=args.telegram,
+    )
 
 
 if __name__ == "__main__":

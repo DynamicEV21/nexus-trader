@@ -117,6 +117,38 @@ class LiveStratForgeAdapter(Strategy):
             self.parameters["quote_symbol"], Asset.AssetType.CRYPTO
         )
 
+        # ── Telegram notifications (opt-in) ──
+        # Auto-wires if TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are in env.
+        # TelegramNotificationProvider self-skips when creds are missing,
+        # so this is safe to call unconditionally.
+        if self.parameters.get("telegram_enabled", False):
+            try:
+                self.notifications.configure_telegram(
+                    bot_token=os.environ.get("TELEGRAM_BOT_TOKEN"),
+                    chat_id=os.environ.get("TELEGRAM_CHAT_ID"),
+                    parse_mode="Markdown",
+                )
+                logger.info(
+                    "Telegram notifications enabled (chat_id=%s)",
+                    os.environ.get("TELEGRAM_CHAT_ID", "(missing)"),
+                )
+                self.notify(
+                    title="🟢 Algo paper-trade started",
+                    message=(
+                        f"Asset: {self.base_asset.symbol}/{self.quote_asset.symbol}\n"
+                        f"Sleeptime: {self.sleeptime}\n"
+                        f"Position size: "
+                        f"{self.parameters['position_size']:.0%}\n"
+                        f"Max daily loss: "
+                        f"{self.parameters['max_daily_loss_pct']}%\n"
+                        f"Max drawdown: "
+                        f"{self.parameters['max_drawdown_pct']}%"
+                    ),
+                    severity="info",
+                )
+            except Exception as exc:
+                logger.warning("Telegram setup skipped: %s", exc)
+
         # State tracking
         self._in_position = False
         self._entry_price = 0.0
@@ -307,6 +339,21 @@ class LiveStratForgeAdapter(Strategy):
             f"ENTRY {self.base_asset.symbol} @ ~{price:.2f} "
             f"qty={qty:.6f} ({max_size:.0%} of portfolio){stop_str}"
         )
+        # Telegram notification on entry
+        if self.parameters.get("telegram_enabled", False):
+            try:
+                self.notify(
+                    title=f"🟢 BUY {self.base_asset.symbol}",
+                    message=(
+                        f"Price: ~{price:.2f} {self.quote_asset.symbol}\n"
+                        f"Qty: {qty:.6f} ({max_size:.0%} of portfolio)\n"
+                        f"Value: ~{target_value:.2f} {self.quote_asset.symbol}"
+                        f"{stop_str}"
+                    ),
+                    severity="info",
+                )
+            except Exception as exc:
+                logger.debug("Telegram ENTRY notify failed: %s", exc)
 
     def _execute_exit(self) -> None:
         """Execute a sell order."""
@@ -321,6 +368,20 @@ class LiveStratForgeAdapter(Strategy):
             f"EXIT {self.base_asset.symbol} "
             f"(entry={self._entry_price:.2f}, pnl={pnl:+.2f}%)"
         )
+        # Telegram notification on exit
+        if self.parameters.get("telegram_enabled", False):
+            try:
+                pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                self.notify(
+                    title=f"{pnl_emoji} SELL {self.base_asset.symbol} (PnL {pnl:+.2f}%)",
+                    message=(
+                        f"Entry: {self._entry_price:.2f}\n"
+                        f"PnL: {pnl:+.2f}%"
+                    ),
+                    severity="info" if pnl >= 0 else "warning",
+                )
+            except Exception as exc:
+                logger.debug("Telegram EXIT notify failed: %s", exc)
         self._entry_price = 0.0
         self._stop_price = 0.0
 
