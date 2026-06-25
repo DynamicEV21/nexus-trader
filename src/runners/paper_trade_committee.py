@@ -45,6 +45,17 @@ Telegram notifications fire on:
   - Each committee run start/finish
   - Order fills (filled, partial_fill, canceled)
   - Risk halts (max_daily_loss, max_drawdown)
+
+Telegram notes (2026-06-25 audit):
+- Telegram messages are sent in PLAIN TEXT (parse_mode=None) because agent
+  output routinely contains underscores (mean_reversion, BTC_USDT,
+  meta_cmo_alma_atr_wf_v1, etc.). Telegram's MarkdownV1 parser treats `_` as
+  an italic delimiter and rejects unclosed underscores with HTTP 400 — every
+  committee summary would fail. Plain text is safer and still readable.
+- ``self.notify()`` returns a ``list[NotificationResult]`` (one per
+  provider), NOT a single result. We use ``_send_notify()`` to iterate the
+  list and log any failures — the previous ``hasattr(result, 'ok')`` check
+  was a silent no-op because lists have no ``.ok`` attribute.
 """
 
 from __future__ import annotations
@@ -136,6 +147,54 @@ def make_committee_strategy_class():
     """
     from src.strategies.nexus_committee import NexusCommitteeStrategy
 
+    def _send_notify(strategy, *, title, message, severity="info", parse_mode=None):
+        """Send a Telegram notification and LOG any failures.
+
+        ``strategy.notify()`` returns a ``list[NotificationResult]`` (one per
+        configured provider). The previous implementation used
+        ``hasattr(result, 'ok') and not result.ok`` to check for failures,
+        which silently no-op'd because lists have no ``.ok`` attribute. This
+        helper iterates the list and logs every failure with the actual
+        message_id (on success) or reason (on failure).
+
+        ``parse_mode`` is ONLY forwarded to the provider when it's a non-empty
+        string. Passing ``parse_mode=None`` causes LumiBot's
+        TelegramNotificationProvider to include ``\"parse_mode\": null`` in
+        the JSON payload, which Telegram rejects with HTTP 400. So when
+        callers want plain text (no parse_mode), we omit the kwarg entirely.
+        """
+        kwargs = {}
+        if parse_mode:  # truthy check: only forward when non-empty string
+            kwargs["parse_mode"] = parse_mode
+        try:
+            results = strategy.notify(
+                title=title,
+                message=message,
+                severity=severity,
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.warning("Notify raised for %r: %s", title, exc)
+            return
+        # results is list[NotificationResult] (possibly empty)
+        if not results:
+            logger.warning("Notify returned no results for %r (no providers?)", title)
+            return
+        for r in results:
+            if r.ok:
+                mid = None
+                if r.payload and isinstance(r.payload, dict):
+                    mid = r.payload.get("result", {}).get("message_id")
+                logger.info(
+                    "Telegram sent: %r (provider=%s, message_id=%s)",
+                    title, r.provider, mid,
+                )
+            else:
+                logger.warning(
+                    "Telegram FAILED: %r (provider=%s, skipped=%s, reason=%s)",
+                    title, r.provider, r.skipped, r.reason,
+                )
+
     class PaperTradeCommitteeStrategy(NexusCommitteeStrategy):
         parameters = {
             # CLI-overridable (see __init__ kwargs)
@@ -149,6 +208,11 @@ def make_committee_strategy_class():
             # can run >10 LLM calls per agent; comfortable for 5 iterations).
             "agent_max_model_calls": 30,
         }
+        # Run immediately on startup rather than waiting an hour for the
+        # first cron tick. Without this, the first committee run is delayed
+        # by up to one hour after launch (because LumiBot's cron fires every
+        # hour with cron_count_target=4 for 4H sleeptime).
+        force_start_immediately = True
 
         def initialize(self) -> None:
             """LumiBot lifecycle hook — runs once at strategy start.
@@ -156,45 +220,59 @@ def make_committee_strategy_class():
             Delegates to the parent (which sets up agents + tools) then
             configures Telegram notifications if creds are present.
             """
-            # Honor 4H bar like the algo paper trader (rather than the
-            # default 1D in the backtest variant) so the committee and
-            # algo runners evaluate at the same time. This makes
-            # side-by-side comparison trivial.
-            self.sleeptime = "4H"
-
             super().initialize()
+
+            # Honor 4H bar like the algo paper trader (rather than the
+            # default 1D set by NexusCommitteeStrategy.initialize) so the
+            # committee and algo runners evaluate at the same time. We
+            # MUST set this AFTER super().initialize() because the parent
+            # overrides sleeptime to "1D" on every call.
+            self.sleeptime = "4H"
 
             # ── Telegram notifications ──────────────────────────────
             # Wire the built-in LumiBot Telegram provider if creds exist.
             # It self-skips if TELEGRAM_BOT_TOKEN/CHAT_ID are missing.
+            #
+            # parse_mode=None (plain text) is intentional. Telegram's
+            # MarkdownV1 parser treats `_` as an italic delimiter and
+            # rejects messages with unclosed underscores (HTTP 400).
+            # Agent output routinely contains underscores (mean_reversion,
+            # BTC_USDT, strategy names, etc.) — using Markdown there
+            # would silently fail every notify. Plain text is safer and
+            # still readable. Emoji in titles still render correctly.
+            #
+            # IMPORTANT: NexusCommitteeStrategy.initialize() (called via
+            # super() above) also calls configure_telegram() with no args
+            # if enable_notifications=True. That would leave us with TWO
+            # Telegram providers → every notify fires twice. Clear the
+            # list first, then add ours.
+            self.notifications.providers.clear()
             try:
                 self.notifications.configure_telegram(
                     bot_token=os.environ.get("TELEGRAM_BOT_TOKEN"),
                     chat_id=os.environ.get("TELEGRAM_CHAT_ID"),
-                    parse_mode="Markdown",
+                    parse_mode=None,
                 )
                 logger.info(
-                    "Telegram notifications configured (chat_id=%s)",
+                    "Telegram notifications configured (chat_id=%s, plain_text)",
                     os.environ.get("TELEGRAM_CHAT_ID", "(missing)"),
                 )
             except Exception as exc:
                 logger.warning("Telegram setup skipped: %s", exc)
 
             # Startup notification
-            try:
-                self.notify(
-                    title="🟢 Committee paper-trade started",
-                    message=(
-                        f"Asset: {self.parameters.get('universe')}\n"
-                        f"Sleeptime: {self.sleeptime}\n"
-                        f"Max position: "
-                        f"{self.parameters.get('max_position_pct', 0):.0%}\n"
-                        f"Started: {datetime.now().isoformat()}"
-                    ),
-                    severity="info",
-                )
-            except Exception as exc:
-                logger.debug("Startup notify skipped: %s", exc)
+            _send_notify(
+                self,
+                title="🟢 Committee paper-trade started",
+                message=(
+                    f"Asset: {self.parameters.get('universe')}\n"
+                    f"Sleeptime: {self.sleeptime}\n"
+                    f"Max position: "
+                    f"{self.parameters.get('max_position_pct', 0):.0%}\n"
+                    f"Started: {datetime.now().isoformat()}"
+                ),
+                severity="info",
+            )
 
         def on_trading_iteration(self) -> None:
             """LumiBot lifecycle hook — runs every self.sleeptime.
@@ -203,73 +281,58 @@ def make_committee_strategy_class():
             start/end notifications so you get a push per bar.
             """
             run = (self.vars.committee_run_count or 0) + 1
-            try:
-                result = self.notify(
-                    title=f"📊 Committee run {run} starting",
-                    message=(
-                        f"Time: {self.get_datetime().isoformat()}\n"
-                        f"Universe: {self.parameters.get('universe')}"
-                    ),
-                    severity="info",
-                )
-                if hasattr(result, 'ok') and not result.ok:
-                    logger.warning("Committee start notify ok=False: %s",
-                                   getattr(result, 'reason', ''))
-            except Exception as exc:
-                logger.warning("Committee start notify raised: %s", exc)
+            _send_notify(
+                self,
+                title=f"📊 Committee run {run} starting",
+                message=(
+                    f"Time: {self.get_datetime().isoformat()}\n"
+                    f"Universe: {self.parameters.get('universe')}"
+                ),
+                severity="info",
+            )
 
             try:
                 super().on_trading_iteration()
-                # If parent didn't raise, the run completed cleanly.
-                # Use getattr — the parent may set last_decision_summary in
-                # some versions but not others. Crashing here would prevent
-                # the success notification from ever firing.
-                summary = getattr(self.vars, 'last_decision_summary', '') or ''
-                summary = summary[:500]
-                try:
-                    result = self.notify(
-                        title=f"✅ Committee run {run} complete",
-                        message=summary or "(no summary)",
-                        severity="info",
-                    )
-                    if hasattr(result, 'ok') and not result.ok:
-                        logger.warning("Committee complete notify ok=False: %s",
-                                       getattr(result, 'reason', ''))
-                except Exception as exc:
-                    logger.warning("Committee complete notify raised: %s", exc)
             except Exception as exc:
                 logger.exception("Committee run %d failed", run)
-                # Sanitize error message — Telegram MarkdownV1 doesn't support
-                # triple backticks for code blocks, and unescaped asterisks,
-                # underscores, pipes, etc. in tracebacks will be rejected or
-                # rendered as blank/garbled ("air"). Send as plain text with
-                # Markdown special chars escaped.
-                exc_text = str(exc)[:800]
-                # Telegram MarkdownV1 special chars need escaping. Backtick
-                # in tracebacks becomes a single quote (no good escape).
-                for ch in ('*', '_', '[', ']', '`'):
-                    exc_text = exc_text.replace(ch, '\\' + ch)
-                try:
-                    self.notify(
-                        title=f"❌ Committee run {run} FAILED",
-                        message=exc_text,
-                        severity="error",
-                        parse_mode=None,
-                    )
-                except Exception:
-                    pass
+                # Plain text — Markdown escaping is unreliable for dynamic
+                # agent output and tracebacks (contains _, *, [, ], etc.).
+                _send_notify(
+                    self,
+                    title=f"❌ Committee run {run} FAILED",
+                    message=str(exc)[:800],
+                    severity="error",
+                )
                 raise
+
+            # ── Build a useful summary from the parent's state vars ──
+            # The parent sets several self.vars.* fields during the run;
+            # we surface the most actionable ones in the notification.
+            regime = getattr(self.vars, "current_regime", "unknown") or "unknown"
+            decision = getattr(self.vars, "last_decision_action", "") or ""
+            confidence = getattr(self.vars, "last_decision_confidence", "")
+            summary = (
+                f"Action: {decision or 'HOLD'}\n"
+                f"Regime: {regime}\n"
+                f"Confidence: {confidence}\n"
+                f"Run: {run}\n"
+                f"Time: {datetime.now().isoformat()}"
+            )
+            _send_notify(
+                self,
+                title=f"✅ Committee run {run} complete — {decision or 'HOLD'}",
+                message=summary,
+                severity="info",
+            )
 
         def on_finish(self, *args, **kwargs) -> None:
             """LumiBot lifecycle hook — runs at strategy shutdown."""
-            try:
-                self.notify(
-                    title="🔴 Committee paper-trade stopped",
-                    message=f"Finished: {datetime.now().isoformat()}",
-                    severity="warning",
-                )
-            except Exception:
-                pass
+            _send_notify(
+                self,
+                title="🔴 Committee paper-trade stopped",
+                message=f"Finished: {datetime.now().isoformat()}",
+                severity="warning",
+            )
             super().on_finish(*args, **kwargs)
 
     return PaperTradeCommitteeStrategy

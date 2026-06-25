@@ -182,6 +182,9 @@ class NexusCommitteeStrategy(Strategy):
         self.vars.last_bull_case = None
         self.vars.last_bear_case = None
         self.vars.current_regime = "unknown"
+        self.vars.last_regime_result = None
+        self.vars.last_decision_action = ""
+        self.vars.last_decision_confidence = ""
         self.vars.committee_run_count = 0
 
         # Notifications (Telegram, email)
@@ -618,6 +621,20 @@ sys.stdout.flush()
             else:
                 action = "hold"
 
+            # Expose decision to runner so Telegram notify can include it
+            # (the runner's _send_notify() reads self.vars.last_decision_action,
+            # last_decision_confidence, current_regime to build the message).
+            self.vars.last_decision_action = action
+            try:
+                # Try to capture the most recent regime confidence if available
+                regime_obj = getattr(self.vars, "last_regime_result", None)
+                if regime_obj and isinstance(regime_obj, dict):
+                    self.vars.last_decision_confidence = regime_obj.get("confidence", "")
+                else:
+                    self.vars.last_decision_confidence = ""
+            except Exception:
+                self.vars.last_decision_confidence = ""
+
             # Write decision to agent_memory
             sync_committee_decision({
                 "symbol": symbol,
@@ -715,10 +732,13 @@ sys.stdout.flush()
             context["regime_confidence"] = regime_result.get("confidence", 0.0)
             context["regime_details"] = regime_result
             self.vars.current_regime = regime_result.get("regime", "unknown")
+            # Cache full result so the runner can read confidence for Telegram
+            self.vars.last_regime_result = regime_result
             logger.debug("Pre-fetched regime: %s", context["current_regime"])
         except Exception:
             context["current_regime"] = "unknown"
             context["regime_confidence"] = 0.0
+            self.vars.last_regime_result = None
 
         # Try to get memory stats
         try:
