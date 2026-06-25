@@ -51,6 +51,52 @@ if _NEXUS_SRC not in sys.path:
 # nexus-trade/src and agentic-quant-os/src by using importlib.
 # ---------------------------------------------------------------------------
 
+import time as _time
+
+
+def _retry_write(client, sql: str, parameters: list | None = None,
+                 *, attempts: int = 4, base_delay_s: float = 0.1) -> bool:
+    """Execute a write with retry-on-DuckLake-conflict.
+
+    DuckLake's optimistic concurrency check (``CheckForConflicts`` in
+    ducklake.duckdb_extension) raises an assertion failure when another
+    writer commits between our snapshot read and our commit. The standard
+    recovery is to retry the transaction with exponential backoff.
+
+    Catches: ``duckdb.Error``, ``IOError``, and bare ``Exception`` (logged
+    at WARNING so the failure isn't silent).
+
+    Returns True on success, False on final failure.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if parameters is not None:
+                client.execute_write(sql, parameters)
+            else:
+                client.execute_write(sql)
+            if attempt > 1:
+                logger.info(
+                    "AQS write succeeded on attempt %d/%d after retry",
+                    attempt, attempts,
+                )
+            return True
+        except Exception as exc:  # noqa: BLE001 — DuckLake can raise anything
+            last_exc = exc
+            if attempt >= attempts:
+                logger.warning(
+                    "AQS write failed after %d attempts; giving up: %s",
+                    attempts, exc,
+                )
+                return False
+            delay = base_delay_s * (3 ** (attempt - 1))  # 0.1s, 0.3s, 0.9s
+            logger.warning(
+                "AQS write attempt %d/%d failed (%s); retrying in %.2fs",
+                attempt, attempts, exc, delay,
+            )
+            _time.sleep(delay)
+    return False  # unreachable
+
 import importlib
 import importlib.util
 
@@ -202,8 +248,13 @@ def sync_committee_decision(
             "timestamp": ts,
         }, default=str)
 
-        # Use plain INSERT (not INSERT OR REPLACE) — DuckLake lacks unique constraints
-        client.execute_write(
+        # Use plain INSERT (not INSERT OR REPLACE) — DuckLake lacks unique constraints.
+        # Wrap with retry: DuckLake's optimistic concurrency check
+        # (``CheckForConflicts``) raises assertion failures when another writer
+        # commits between our snapshot read and our commit. Standard recovery
+        # is to retry with exponential backoff.
+        ok = _retry_write(
+            client,
             """
             INSERT INTO agent_memory
                 (agent_name, memory_type, key, value_json, created_at, access_count)
@@ -211,8 +262,9 @@ def sync_committee_decision(
             """,
             ["nexus-trade", "trade_decision", key, value_json, ts, 0],
         )
-        logger.info("Synced decision to AQS: %s (%s)", key, action)
-        return True
+        if ok:
+            logger.info("Synced decision to AQS: %s (%s)", key, action)
+        return ok
     except Exception as exc:
         logger.warning("Failed to sync decision to AQS: %s", exc)
         return False
@@ -290,17 +342,36 @@ def sync_trade_result(
     if client is None:
         return False
 
-    try:
-        client.write_nexus_trade_result(result)
-        logger.info(
-            "Synced trade result to AQS: %s/%s",
-            result.get("strategy_name", "unknown"),
-            result.get("ticker", "unknown"),
-        )
-        return True
-    except Exception as exc:
-        logger.warning("Failed to sync trade result to AQS: %s", exc)
-        return False
+    last_exc: Exception | None = None
+    # Wrap with retry: write_nexus_trade_result internally calls execute_write,
+    # which can hit DuckLake optimistic-concurrency conflicts when other
+    # writers (e.g. AQOS stratforge sweeps) commit concurrently.
+    for attempt in range(1, 4):
+        try:
+            client.write_nexus_trade_result(result)
+            logger.info(
+                "Synced trade result to AQS: %s/%s",
+                result.get("strategy_name", "unknown"),
+                result.get("ticker", "unknown"),
+            )
+            if attempt > 1:
+                logger.info("trade_result succeeded on attempt %d/3", attempt)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt >= 3:
+                logger.warning(
+                    "Failed to sync trade result to AQS after 3 attempts: %s",
+                    exc,
+                )
+                return False
+            delay = 0.1 * (3 ** (attempt - 1))
+            logger.warning(
+                "trade_result attempt %d/3 failed (%s); retrying in %.2fs",
+                attempt, exc, delay,
+            )
+            _time.sleep(delay)
+    return False  # unreachable
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +402,12 @@ def sync_signal(
             signal["source"] = "nexus-trade"
 
         sid = signal.get("id") or str(uuid.uuid4())
-        # Use plain INSERT (DuckLake lacks unique constraints for OR REPLACE)
-        client.execute_write(
+        # Use plain INSERT (DuckLake lacks unique constraints for OR REPLACE).
+        # Wrap with retry: DuckLake optimistic concurrency can fail with an
+        # assertion failure if another writer commits between our snapshot
+        # read and our commit. Standard recovery: exponential backoff retry.
+        ok = _retry_write(
+            client,
             """
             INSERT INTO signals
                 (id, source, signal_type, ticker, value, confidence,
@@ -352,13 +427,14 @@ def sync_signal(
                 signal.get("created_at", datetime.now(timezone.utc)),
             ],
         )
-        logger.info(
-            "Synced signal to AQS: %s %s = %.1f",
-            signal.get("signal_type", ""),
-            signal.get("ticker", ""),
-            signal.get("value", 0),
-        )
-        return True
+        if ok:
+            logger.info(
+                "Synced signal to AQS: %s %s = %.1f",
+                signal.get("signal_type", ""),
+                signal.get("ticker", ""),
+                signal.get("value", 0),
+            )
+        return ok
     except Exception as exc:
         logger.warning("Failed to sync signal to AQS: %s", exc)
         return False
