@@ -11,8 +11,11 @@ Pipeline
 --------
 
 ```
-LOAD → DATA → SIGNALS → BACKTEST → METRICS → GATES → WALKS → MONTE CARLO → REPORT
+LOAD → DATA → SIGNALS → BACKTEST → METRICS → GATES → WALKS → REPORT
 ```
+
+(Monte Carlo was removed 2026-06-25 per Tristan — we are testing/exploring
+and the realbt OOS walks already provide the production-relevant metrics.)
 
 The gate is deliberately **AQOS-venv only** — the lumibot venv lacks
 realbt/raptorbt. ``paper_trade.py`` reads the persisted gate results
@@ -175,10 +178,11 @@ class GateProfile:
     wf_oos_max_dd_ratio: float = 1.5  # OOS <= 1.5 * IS
     wf_oos_win_rate_ratio: float = 0.7  # OOS >= 0.7 * IS
 
-    # Monte Carlo
-    mc_p_loss_max: float = 0.25
-    mc_p_ruin_max: float = 0.05
-    mc_cvar95_min: float = -0.30
+    # Monte Carlo — removed 2026-06-25 (Tristan: testing mode, no MC).
+    # Thresholds kept as 0 / disabled for backward compat with persisted profiles.
+    mc_p_loss_max: float = 1.0
+    mc_p_ruin_max: float = 1.0
+    mc_cvar95_min: float = -1.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1003,22 +1007,11 @@ def run_gate(
             wf["oos_win_rate"] * 100, wf["wf_efficiency"],
         )
 
-    # Stage 8: Monte Carlo
-    mc = monte_carlo_check(metrics, n_simulations=10000)
-    result.mc_p_loss = mc["p_loss"]
-    result.mc_p_ruin = mc["p_ruin"]
-    result.mc_cvar95 = mc["cvar95"]
-    result.mc_n_simulations = mc["n_simulations"]
-    mc_failed = check_mc_gates(mc, profile)
-    result.failed_gates.extend(f"mc:{f}" for f in mc_failed)
-
-    if verbose:
-        logger.info(
-            "[MONTE CARLO] p_loss=%.2f%% p_ruin=%.2f%% cvar95=%.2f%%",
-            mc["p_loss"] * 100, mc["p_ruin"] * 100, mc["cvar95"] * 100,
-        )
-
-    # Stage 9: Verdict
+    # Stage 8: Verdict (realbt-only IS + WF; no Monte Carlo — Tristan 2026-06-25)
+    # We dropped MC because (a) it's CPU-heavy (10k simulations per strategy),
+    # (b) we are testing/exploring right now, not gating for production, and
+    # (c) the realbt OOS walks already give us OOS Sortino / Max DD / Win Rate
+    # which are the actual decision-driving metrics for live deployment.
     result.passed = len(result.failed_gates) == 0
 
     # Persist
