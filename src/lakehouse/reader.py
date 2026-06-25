@@ -232,6 +232,7 @@ class NexusLakehouseReader:
         ticker: str = "",
         sort_by: str = "sortino",
         limit: int = 20,
+        as_of: str = "",
     ) -> list[dict[str, Any]]:
         """Validated crypto strategies from v_nexus_strategy_pool.
 
@@ -284,6 +285,26 @@ class NexusLakehouseReader:
         }
         order_by = order_by_map.get(sort_by, order_by_map["sortino"])
         params.append(limit)
+
+        # B2 anti-leakage (2026-06-25): when ``as_of`` is set, route the
+        # query through the ``v_nexus_strategy_pool_asof`` macro so we
+        # only see rows whose as_of_timestamp <= the bound. The macro's
+        # own WHERE applies the cutoff; we then layer the filter params
+        # on top. Falls back to the plain view if the macro isn't
+        # installed (e.g., the migration hasn't run yet).
+        if as_of:
+            try:
+                # The macro already has its own WHERE; we need to add
+                # the user's filters as a NEW WHERE on the outer query.
+                asof_clause = where.replace("WHERE ", "", 1) if where else ""
+                outer_where = f"WHERE {asof_clause}" if asof_clause else ""
+                return self._query(
+                    f"SELECT * FROM v_nexus_strategy_pool_asof(?) {outer_where} "
+                    f"ORDER BY {order_by} LIMIT ?",
+                    [as_of] + params,
+                )
+            except Exception as exc:
+                logger.debug("v_nexus_strategy_pool_asof failed (%s); falling back", exc)
         return self._query(
             f"SELECT * FROM v_nexus_strategy_pool {where} "
             f"ORDER BY {order_by} LIMIT ?", params

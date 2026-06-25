@@ -440,12 +440,23 @@ sys.stdout.flush()
 
     def on_trading_iteration(self) -> None:
         """Run a full investment committee session."""
+        # B2 anti-leakage (2026-06-25): register the active sim-time so
+        # every @agent_tool (lakehouse_* + signal_dashboard + regime_tool
+        # + query_trade_memory) can filter results to data points that
+        # existed at this bar. Cleared in the finally block.
+        from src.tools._strategy_context import register_sim_time, clear_sim_time
+
         self.vars.committee_run_count += 1
         run = self.vars.committee_run_count
 
         universe = list(self.parameters.get("universe") or DEFAULT_UNIVERSE)
         now = self.get_datetime()
-        logger.info("[NexusCommittee run %d] Session at %s, universe=%s", run, now.isoformat(), universe)
+        # Register sim-time for the duration of this iteration. Use the
+        # bar's datetime (NOT wall-clock) so backtests don't leak future
+        # data into the LLM's context.
+        sim_time_iso = now.isoformat() if hasattr(now, "isoformat") else str(now)
+        register_sim_time(sim_time_iso)
+        logger.info("[NexusCommittee run %d] Session at %s, universe=%s", run, sim_time_iso, universe)
 
         # ── Phase 0: Pre-fetch regime and memory context (background) ──
         context = self._build_context(universe)
@@ -733,6 +744,13 @@ sys.stdout.flush()
                     logger.warning("[NexusCommittee run %d] Bridge auto-sync failed: %s", run, exc)
             else:
                 logger.debug("NEXUS_VENV_AQOS not set — skipping bridge auto-sync")
+
+        # B2 anti-leakage (2026-06-25): clear sim-time so the next
+        # iteration (or background thread) doesn't see a stale value.
+        try:
+            clear_sim_time()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Context builder

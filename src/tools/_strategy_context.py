@@ -39,6 +39,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _strategy: Any = None
+# B2 anti-leakage (2026-06-25): the active sim-bar datetime (ISO string)
+# that agent tools should use when filtering time-sensitive queries.
+# Set by ``NexusCommitteeStrategy`` / ``PaperTradeCommitteeStrategy`` at
+# the start of every ``on_trading_iteration()`` and cleared at the end.
+_sim_time: str | None = None
 
 
 def register_strategy(strategy: Any) -> None:
@@ -63,3 +68,33 @@ def clear_strategy() -> None:
     """Clear the registered strategy (useful for testing)."""
     global _strategy
     _strategy = None
+
+
+def register_sim_time(sim_time_iso: str | None) -> None:
+    """Register the active sim-bar datetime (ISO format).
+
+    The sim-time is the ``strategy.get_datetime()`` snapshot taken at
+    the start of an ``on_trading_iteration()``. Agent tools use it as
+    the as-of cutoff for lakehouse and vector-memory queries to
+    prevent look-ahead bias.
+
+    Pass ``None`` to clear (e.g., at end of iteration or in tests).
+    """
+    global _sim_time
+    _sim_time = sim_time_iso
+    logger.debug("Sim-time registered with _strategy_context: %s", sim_time_iso)
+
+
+def get_sim_time() -> str | None:
+    """Return the active sim-time (ISO string) or None if not registered.
+
+    Agent tools should fall back to ``strategy.get_datetime()`` if this
+    returns None (live mode), and to wall-clock if even that fails.
+    """
+    return _sim_time
+
+
+def clear_sim_time() -> None:
+    """Clear the registered sim-time (useful for testing)."""
+    global _sim_time
+    _sim_time = None

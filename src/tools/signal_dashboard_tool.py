@@ -70,7 +70,13 @@ def signal_dashboard_tool(
         return {"symbol": symbol, "error": "No strategy registered"}
 
     try:
-        df = strategy.get_historical_prices(symbol, length=lookback, timestep="day")
+        # B2 anti-leakage (2026-06-25): the strategy runs on a 4H bar
+        # cycle. ``timestep="day"`` is ambiguous for crypto (daily is a
+        # rolling 24h window with no real "close"), and the daily bar
+        # boundary (00:00 UTC) can include data past the current 4H bar.
+        # Use ``timestep="4H"`` to align the OHLCV window with the
+        # strategy's decision cycle.
+        df = strategy.get_historical_prices(symbol, length=lookback, timestep="4H")
         if df is None:
             return {"symbol": symbol, "error": "No price data available"}
 

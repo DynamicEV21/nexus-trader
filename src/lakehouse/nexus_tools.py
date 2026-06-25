@@ -31,6 +31,29 @@ def _get_reader():
     return get_reader()
 
 
+def _get_sim_time() -> str:
+    """Read the active sim-time from the strategy context (B2 anti-leakage).
+
+    Falls back to ``strategy.get_datetime()`` for live mode and to
+    wall-clock only as a last resort (so non-strategy callers don't
+    crash). Returns an empty string if no sim-time is available — in
+    that case the reader falls back to the non-asof view (legacy
+    behavior).
+    """
+    from src.tools._strategy_context import get_sim_time, get_strategy
+    sim = get_sim_time()
+    if sim:
+        return sim
+    try:
+        strategy = get_strategy()
+        if strategy is not None and hasattr(strategy, "get_datetime"):
+            dt = strategy.get_datetime()
+            return dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+    except Exception:
+        pass
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Tool functions  (each takes ``self`` — the strategy instance)
 # ---------------------------------------------------------------------------
@@ -156,6 +179,10 @@ def lakehouse_strategy_candidates(
         # is "sortino DESC NULLS LAST, sharpe DESC NULLS LAST, composite_score DESC NULLS LAST".
         # ``sort_by='sortino'`` is now the default in the reader; pass it
         # explicitly so this function is self-documenting.
+        # B2 anti-leakage (2026-06-25): pass the active sim-time as
+        # ``as_of`` so the reader routes the query through the asof macro
+        # and only returns rows whose as_of_timestamp <= current sim bar.
+        sim_time = _get_sim_time()
         strategies = reader.get_strategy_pool(
             regime_label=regime,
             min_composite=min_composite,
@@ -164,6 +191,7 @@ def lakehouse_strategy_candidates(
             ticker=ticker,
             sort_by="sortino",
             limit=limit,
+            as_of=sim_time,
         )
 
         # Detect whether the upstream table is Sharpe-only (no Sortino
@@ -191,6 +219,7 @@ def lakehouse_strategy_candidates(
         result: dict[str, Any] = {
             "strategies": strategies,
             "count": len(strategies),
+            "as_of_sim_time": sim_time,
         }
         if sharpe_only:
             result["note"] = "sharpe_only"

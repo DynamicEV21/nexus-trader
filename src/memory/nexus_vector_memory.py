@@ -79,6 +79,14 @@ class NexusDecisionRecord(LanceModel):
     outcome: str = Field(description="win, loss, or pending")
     pnl_pct: float = 0.0
     timestamp: str
+    # B2 anti-leakage (2026-06-25): the backtest sim-time at which the
+    # decision was made. ``timestamp`` is wall-clock ISO; ``decision_sim_time``
+    # is the LumiBot bar datetime (the boundary the LLM was *actually*
+    # reasoning at). When pre-filtering trade memory for an in-progress
+    # backtest or live committee run we use ``decision_sim_time`` to
+    # avoid leaking decisions made at FUTURE sim-bars into the agent's
+    # context.
+    decision_sim_time: str = ""
     strategy_name: str = "Nexus_Trader"
     backtest_id: str = ""
 
@@ -417,6 +425,7 @@ class NexusVectorMemory:
                 outcome=decision.get("outcome", "pending"),
                 pnl_pct=float(decision.get("pnl_pct", 0.0)),
                 timestamp=decision.get("timestamp", ""),
+                decision_sim_time=decision.get("decision_sim_time", "") or decision.get("timestamp", ""),
                 strategy_name=decision.get("strategy_name", "Nexus_Trader"),
                 backtest_id=decision.get("backtest_id", ""),
             )
@@ -687,8 +696,9 @@ class NexusVectorMemory:
         n_results: int = 5,
         symbol: str | None = None,
         regime: str | None = None,
+        as_of_sim_time: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Find similar past trade decisions by semantic similarity.
+        """Find similar past trade decisions by semantic similarity (B2-aware).
 
         Parameters
         ----------
@@ -700,6 +710,12 @@ class NexusVectorMemory:
             Optional filter by symbol.
         regime : str | None
             Optional filter by market regime.
+        as_of_sim_time : str | None
+            ISO datetime string. Only decisions whose
+            ``decision_sim_time`` (or fallback ``timestamp``) is <=
+            ``as_of_sim_time`` will be returned. B2 anti-leakage — pass
+            the active sim-bar's datetime to avoid leaking future bars'
+            decisions into the LLM's context. Defaults to None (no filter).
 
         Returns
         -------
@@ -718,7 +734,11 @@ class NexusVectorMemory:
             if not query_vector:
                 return []
 
-            query = self._decisions_table.search(query_vector).limit(n_results)
+            # When filtering by as_of, fetch a bit more than n_results
+            # so the post-filter doesn't shrink the result set below the
+            # requested size.
+            fetch_n = n_results * 3 if as_of_sim_time else n_results
+            query = self._decisions_table.search(query_vector).limit(fetch_n)
 
             # Build SQL WHERE clause from filters
             clauses: list[str] = []
@@ -730,6 +750,11 @@ class NexusVectorMemory:
                 query = query.where(" AND ".join(clauses), prefilter=True)
 
             rows = query.to_list()
+
+            # B2 anti-leakage: drop rows whose sim_time is after the cutoff.
+            if as_of_sim_time:
+                rows = self._filter_by_sim_time(rows, as_of_sim_time)
+            rows = rows[:n_results]
 
             results: list[dict[str, Any]] = []
             for row in rows:
@@ -744,6 +769,46 @@ class NexusVectorMemory:
         except Exception:
             logger.exception("Decision search failed: %s", query_text[:100])
             return []
+
+    # ------------------------------------------------------------------
+    # B2 anti-leakage helper
+    # ------------------------------------------------------------------
+    def _filter_by_sim_time(
+        self,
+        rows: list[dict[str, Any]],
+        as_of_sim_time: str,
+    ) -> list[dict[str, Any]]:
+        """Post-filter LanceDB rows by ``decision_sim_time <= as_of_sim_time``.
+
+        B2 anti-leakage: the LLM at sim-bar T must not see decisions
+        made at sim-bars > T. LanceDB's vector search returns results
+        in similarity order BEFORE we can apply SQL filters, so we
+        filter the result list in Python. This is fine because n_results
+        is small (default 5-20).
+        """
+        if not as_of_sim_time:
+            return rows
+        try:
+            from datetime import datetime
+            cutoff = datetime.fromisoformat(as_of_sim_time.replace("Z", "+00:00"))
+        except Exception:
+            logger.debug("as_of_sim_time=%r is not parseable - skipping filter", as_of_sim_time)
+            return rows
+        kept: list[dict[str, Any]] = []
+        for row in rows:
+            dst = row.get("decision_sim_time") or row.get("timestamp") or ""
+            if not dst:
+                kept.append(row)
+                continue
+            try:
+                row_dt = datetime.fromisoformat(dst.replace("Z", "+00:00"))
+            except Exception:
+                kept.append(row)
+                continue
+            if row_dt <= cutoff:
+                kept.append(row)
+        return kept
+
 
     # ------------------------------------------------------------------
     # Public API — Lessons
@@ -1316,7 +1381,10 @@ class NexusVectorMemory:
             if regime:
                 clauses.append(f"regime = '{regime.replace(chr(39), chr(39)+chr(39))}'")
             if min_sortino > 0:
-                clauses.append(f"sortino >= {float(min_sortino)}")
+                # Legacy backfilled Sortino values (from pre-2026-06-25 windows)
+                # are >= 0; real Sortino values are also >= 0. We treat 0 as
+                # "not measured" so the filter excludes backfilled noise.
+                clauses.append(f"sortino > {float(min_sortino)}")
             if only_profitable:
                 clauses.append("profitable = true")
             if clauses:

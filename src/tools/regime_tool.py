@@ -104,9 +104,25 @@ def _fetch_regime_data(
                 # 1h bars to get more samples. We then resample to daily
                 # (close at end of UTC day) for the CrabQuant detector.
                 ccxt_timeframe = "1h"
-                ohlcv = api.fetch_ohlcv(
-                    ccxt_symbol, ccxt_timeframe, limit=min(1000, max(lookback * 4, 200))
-                )
+                # B2 anti-leakage (2026-06-25): in BACKTEST mode the
+                # data source's wall-clock ``now`` is ahead of the
+                # active sim-bar, so ccxt's default (``endTime=None``
+                # = wall-clock) leaks future bars. Thread ``endTime``
+                # from the strategy's get_datetime() so the OHLCV
+                # window stops at the current sim-bar boundary.
+                end_ms: int | None = None
+                try:
+                    dt = strategy.get_datetime()
+                    if dt is not None:
+                        end_ms = int(dt.timestamp() * 1000)
+                except Exception:
+                    end_ms = None
+                kwargs: dict[str, Any] = {
+                    "limit": min(1000, max(lookback * 4, 200)),
+                }
+                if end_ms is not None:
+                    kwargs["params"] = {"endTime": end_ms}
+                ohlcv = api.fetch_ohlcv(ccxt_symbol, ccxt_timeframe, **kwargs)
                 if ohlcv:
                     df = pd.DataFrame(
                         ohlcv, columns=["datetime", "open", "high", "low", "close", "volume"]

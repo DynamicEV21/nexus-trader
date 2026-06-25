@@ -43,6 +43,12 @@ def query_trade_memory_tool(
     decisions and lessons that match the current context.  This helps
     the investment committee learn from prior experience.
 
+    B2 anti-leakage: the active strategy's ``_sim_time`` is read from
+    the strategy context (set by ``NexusCommitteeStrategy`` at the
+    start of every ``on_trading_iteration``). All returned decisions
+    are filtered to those whose ``decision_sim_time <= _sim_time`` —
+    the LLM cannot see decisions made at future sim-bars.
+
     Args:
         query: Natural-language description of the current trade context,
                thesis, or situation.
@@ -56,8 +62,21 @@ def query_trade_memory_tool(
         - **relevant_lessons** (list) — lessons learned from similar situations
         - **context_prompt** (str) — formatted markdown with key findings for inclusion in agent prompts
         - **total_results** (int) — combined count of results found
+        - **as_of_sim_time** (str) — the active sim-time used for filtering (echo for transparency)
     """
     from src.memory.nexus_vector_memory import get_nexus_memory
+    from src.tools._strategy_context import get_strategy, get_sim_time
+
+    # B2: pull the active sim-time so we never leak future bars' decisions.
+    sim_time = get_sim_time()
+    if sim_time is None:
+        # Fall back to wall-clock so live mode still works (legacy).
+        try:
+            strategy = get_strategy()
+            if strategy is not None and hasattr(strategy, "get_datetime"):
+                sim_time = strategy.get_datetime().isoformat()
+        except Exception:
+            pass
 
     try:
         nexus = get_nexus_memory()
@@ -71,7 +90,11 @@ def query_trade_memory_tool(
             }
 
         decisions = nexus.search_similar_decisions(
-            query, n_results=n_results, symbol=symbol or None, regime=regime or None,
+            query,
+            n_results=n_results,
+            symbol=symbol or None,
+            regime=regime or None,
+            as_of_sim_time=sim_time,
         )
         lessons = nexus.search_lessons(query, n_results=n_results)
 
@@ -90,6 +113,7 @@ def query_trade_memory_tool(
             "relevant_lessons": lessons,
             "context_prompt": context_prompt,
             "total_results": len(decisions) + len(lessons),
+            "as_of_sim_time": sim_time or "",
         }
 
         logger.info(
@@ -123,6 +147,10 @@ def remember_decision_tool(
     regime, indicators) so the system can learn from experience.
     Should be called after every trade decision for record-keeping.
 
+    B2 anti-leakage: the active sim-time (from the strategy context)
+    is stamped into ``decision_sim_time`` so future ``query_trade_memory``
+    calls can filter out future-bar decisions during backtests.
+
     Args:
         symbol: Stock symbol (e.g., 'AAPL', 'SPY')
         action: Trade action ('buy', 'sell', or 'hold')
@@ -147,10 +175,17 @@ def remember_decision_tool(
                 "warning": "Vector memory is disabled",
             }
 
-        from src.tools._strategy_context import get_strategy
+        from src.tools._strategy_context import get_strategy, get_sim_time
 
         strategy = get_strategy()
-        timestamp = strategy.get_datetime().isoformat() if strategy and hasattr(strategy, "get_datetime") else ""
+        timestamp = (
+            strategy.get_datetime().isoformat()
+            if strategy and hasattr(strategy, "get_datetime")
+            else ""
+        )
+        # B2: prefer the explicit sim-time if the strategy registered it,
+        # else fall back to wall-clock for live mode.
+        sim_time = get_sim_time() or timestamp
         decision_id = f"decision_{timestamp}_{symbol}"
 
         decision = {
@@ -163,13 +198,14 @@ def remember_decision_tool(
             "outcome": "pending",
             "pnl_pct": 0.0,
             "timestamp": timestamp,
+            "decision_sim_time": sim_time,
             "strategy_name": "Nexus_Trader",
             "backtest_id": backtest_id,
         }
 
         stored = nexus.store_decision(decision)
-        logger.info("Decision %s stored=%s", decision_id, stored)
-        return {"stored": stored, "decision_id": decision_id}
+        logger.info("Decision %s stored=%s (sim_time=%s)", decision_id, stored, sim_time)
+        return {"stored": stored, "decision_id": decision_id, "decision_sim_time": sim_time}
 
     except Exception as exc:
         logger.exception("Failed to remember decision")
