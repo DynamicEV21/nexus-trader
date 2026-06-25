@@ -146,28 +146,28 @@ CREATE_SEQ_SQL = "CREATE SEQUENCE IF NOT EXISTS nexus_seq START 1"
 class GateProfile:
     """Thresholds for the strategy gate. Easy to swap for strict/loose.
 
-    Default profile is calibrated against crypto trend strategies on
-    4h BTC/ETH/SOL (the live deployment universe). The brief's nominal
-    thresholds (Recovery >= 1.5, SQN >= 1.5) are tuned for equity-style
-    daily strategies with lower volatility; on 4h crypto we observed
-    those cut too many WF-validated strategies (e.g.
-    meta_cmo_alma_atr_wf_v1 has avg recovery = 0.73 and per-window SQN
-    ≈ 1.0-2.3 across its 5 profitable WF windows). We've relaxed those
-    two to 1.0 to keep the gate strict-but-passable; everything else
-    uses the brief's defaults.
-    """
-    name: str = "default"
+    Default profile is **loose** — Tristan 2026-06-25 directive: we are
+    testing, want more strategies to pass through, will tighten over time.
+    The 'default' and 'strict' profiles remain available via --profile.
 
-    # IS-required (B6.5)
-    sortino: float = 1.0
-    profit_factor: float = 1.3
-    max_drawdown: float = 0.25  # 25%
-    win_rate: float = 0.40
-    num_trades: int = 30
-    calmar: float = 0.5
-    recovery_factor: float = 1.0  # relaxed from 1.5 for crypto trend
-    sqn: float = 1.0  # relaxed from 1.5 — per-window SQN is noisy on 4H
-    omega_ratio: float = 1.2
+    Loose values are calibrated for 4h BTC/ETH/SOL trend strategies where
+    win-rate dips (35-40%) and recovery factor (0.7-1.5) are typical due to
+    4H noise. Brief's nominal thresholds (Recovery >= 1.5, SQN >= 1.5)
+    are tuned for equity-style daily strategies with lower volatility;
+    those cut too many WF-validated strategies on 4h crypto.
+    """
+    name: str = "loose"
+
+    # IS-required (B6.5) — LOOSE defaults (4h crypto-trend calibrated)
+    sortino: float = 0.5
+    profit_factor: float = 1.1
+    max_drawdown: float = 0.30  # 30% (was 25%)
+    win_rate: float = 0.35  # trend strategies on 4H often <40%
+    num_trades: int = 15
+    calmar: float = 0.4  # was 0.5
+    recovery_factor: float = 0.7  # BTC volatility inflates MDD
+    sqn: float = 0.8  # per-window SQN is noisy on 4H
+    omega_ratio: float = 1.1  # was 1.2
     total_return: float = 0.0
 
     # Walk-forward efficiency
@@ -1035,7 +1035,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("strategy_name", help="e.g. meta_cmo_alma_atr_wf_v1")
     parser.add_argument("--symbol", default="BTC")
     parser.add_argument("--exchange", default="binance")
-    parser.add_argument("--profile", default="default", choices=["default", "strict", "loose"])
+    parser.add_argument("--profile", default="loose", choices=["default", "strict", "loose"],
+                        help="Gate profile. Default is 'loose' (Tristan 2026-06-25: "
+                             "we are testing, want more strategies to pass through; will "
+                             "tighten over time). 'default' = crypto-trend-calibrated. "
+                             "'strict' = brief's original thresholds.")
     parser.add_argument("--no-persist", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
@@ -1051,20 +1055,31 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     profile = GateProfile(name=args.profile)
+    # Class defaults are already 'loose' (Tristan 2026-06-25). Override for
+    # 'strict' only — 'default' and 'loose' use the class-level defaults.
     if args.profile == "strict":
         profile.sortino = 1.5
         profile.profit_factor = 1.5
         profile.max_drawdown = 0.20
         profile.win_rate = 0.45
+        profile.num_trades = 30
         profile.recovery_factor = 1.5
         profile.sqn = 1.5
-    elif args.profile == "loose":
-        profile.sortino = 0.5
-        profile.profit_factor = 1.1
-        profile.num_trades = 15
-        profile.win_rate = 0.35  # trend strategies on 4H often <40%
-        profile.recovery_factor = 0.7  # BTC volatility inflates MDD
-        profile.sqn = 0.8
+        profile.calmar = 0.5
+        profile.omega_ratio = 1.2
+    elif args.profile == "default":
+        # Original crypto-trend-calibrated values (Recovery 1.0, SQN 1.0,
+        # win_rate 0.40, profit_factor 1.3, etc.) — kept for reference and
+        # to allow tightening back up if loose over-permits.
+        profile.sortino = 1.0
+        profile.profit_factor = 1.3
+        profile.max_drawdown = 0.25
+        profile.win_rate = 0.40
+        profile.num_trades = 30
+        profile.calmar = 0.5
+        profile.recovery_factor = 1.0
+        profile.sqn = 1.0
+        profile.omega_ratio = 1.2
 
     result = run_gate(
         strategy_name=args.strategy_name,
