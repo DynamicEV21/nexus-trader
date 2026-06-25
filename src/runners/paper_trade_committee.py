@@ -204,7 +204,7 @@ def make_committee_strategy_class():
             """
             run = (self.vars.committee_run_count or 0) + 1
             try:
-                self.notify(
+                result = self.notify(
                     title=f"📊 Committee run {run} starting",
                     message=(
                         f"Time: {self.get_datetime().isoformat()}\n"
@@ -212,28 +212,49 @@ def make_committee_strategy_class():
                     ),
                     severity="info",
                 )
-            except Exception:
-                pass
+                if hasattr(result, 'ok') and not result.ok:
+                    logger.warning("Committee start notify ok=False: %s",
+                                   getattr(result, 'reason', ''))
+            except Exception as exc:
+                logger.warning("Committee start notify raised: %s", exc)
 
             try:
                 super().on_trading_iteration()
                 # If parent didn't raise, the run completed cleanly.
-                summary = (self.vars.last_decision_summary or "")[:500]
+                # Use getattr — the parent may set last_decision_summary in
+                # some versions but not others. Crashing here would prevent
+                # the success notification from ever firing.
+                summary = getattr(self.vars, 'last_decision_summary', '') or ''
+                summary = summary[:500]
                 try:
-                    self.notify(
+                    result = self.notify(
                         title=f"✅ Committee run {run} complete",
                         message=summary or "(no summary)",
                         severity="info",
                     )
-                except Exception:
-                    pass
+                    if hasattr(result, 'ok') and not result.ok:
+                        logger.warning("Committee complete notify ok=False: %s",
+                                       getattr(result, 'reason', ''))
+                except Exception as exc:
+                    logger.warning("Committee complete notify raised: %s", exc)
             except Exception as exc:
                 logger.exception("Committee run %d failed", run)
+                # Sanitize error message — Telegram MarkdownV1 doesn't support
+                # triple backticks for code blocks, and unescaped asterisks,
+                # underscores, pipes, etc. in tracebacks will be rejected or
+                # rendered as blank/garbled ("air"). Send as plain text with
+                # Markdown special chars escaped.
+                exc_text = str(exc)[:800]
+                # Telegram MarkdownV1 special chars need escaping. Backtick
+                # in tracebacks becomes a single quote (no good escape).
+                for ch in ('*', '_', '[', ']', '`'):
+                    exc_text = exc_text.replace(ch, '\\' + ch)
                 try:
                     self.notify(
                         title=f"❌ Committee run {run} FAILED",
-                        message=f"```\n{str(exc)[:1000]}\n```",
+                        message=exc_text,
                         severity="error",
+                        parse_mode=None,
                     )
                 except Exception:
                     pass
