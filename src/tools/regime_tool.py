@@ -5,8 +5,23 @@ Regime Detection Tool — LumiBot @agent_tool for CrabQuant regime detection
 Wraps ``crabquant.regime.detect_regime()`` as a LumiBot ``@agent_tool``
 that an AI agent can call during committee deliberation.
 
-The tool uses ``self.get_historical_prices()`` to fetch SPY and VIX data,
-then delegates to CrabQuant for regime classification.
+The tool uses ``self.get_historical_prices()`` to fetch SPY data (with
+optional VIX), then delegates to CrabQuant for regime classification.
+
+Notes on crypto broker
+----------------------
+On a crypto broker (Binance, etc.) the only equity TradFi perpetuals
+available are pairs like ``SPY/USDT:USDT`` (Binance) or
+``SPY-PERP/USDC`` (Hyperliquid). The tool:
+
+* Requests SPY with ``quote=USDT`` so the broker resolves the symbol
+  to the right perpetuals contract.
+* Treats VIX as fully optional — never blocks regime detection if
+  VIX is missing (the underlying CrabQuant detector handles
+  ``vix_data=None`` gracefully).
+* Returns ``regime="unknown"`` with a descriptive error message if
+  the broker has no SPY-equivalent at all (e.g., a pure-crypto
+  exchange with no TradFi perpetuals).
 
 Requirements
 ------------
@@ -28,6 +43,88 @@ if _CRABQUANT_PATH not in sys.path:
     sys.path.insert(0, _CRABQUANT_PATH)
 
 logger = logging.getLogger(__name__)
+
+
+def _fetch_regime_data(
+    strategy,
+    symbol: str,
+    lookback: int,
+    LumiBotAsset,
+) -> "pd.DataFrame | None":
+    """Fetch OHLCV bars for a regime input symbol (SPY, VIX, BTC-proxy).
+
+    Strategy
+    --------
+    1. Try lumibot's ``get_historical_prices()`` with ``quote=USDT`` first
+       (works for crypto pairs, like ``BTC/USDT``).
+    2. If that returns nothing AND the symbol is an equity (SPY/VIX),
+       try a direct ccxt call with the proper ``SYMBOL/USDT:USDT``
+       perpetual-swap format that Binance uses. This bypasses lumibot's
+       symbol-normalization which drops the ``:USDT`` colon suffix.
+       For SPY/VIX we use 1h bars because Binance testnet only has ~10
+       days of daily bars (TradFi perpetuals are new). With 1h bars we
+       can get 200+ samples in the same window.
+    3. Return a pandas DataFrame with a ``close`` column, or None on failure.
+
+    Why not always use the direct ccxt path?
+    ----------------------------------------
+    The direct ccxt path only works if the lumibot strategy exposes a
+    ``broker.api`` attribute (i.e., it's a live ccxt broker, not a
+    backtest data source). For backtests we want to use the backtest
+    data source to stay consistent with the rest of the simulation.
+    """
+    import pandas as pd
+
+    # ── Path 1: lumibot get_historical_prices with quote=USDT ──
+    # Skip this path for SPY/VIX — lumibot's symbol format is wrong on
+    # Binance (drops the :USDT colon). Go straight to direct ccxt.
+    if symbol not in ("SPY", "VIX"):
+        try:
+            kwargs = {"length": max(lookback + 10, 30), "timestep": "day"}
+            if LumiBotAsset is not None:
+                kwargs["quote"] = LumiBotAsset("USDT", "crypto")
+            bars = strategy.get_historical_prices(symbol, **kwargs)
+            if bars is not None and not (isinstance(bars, float) and bars != bars):
+                df = bars.df if hasattr(bars, "df") else bars
+                if df is not None and not df.empty and "close" in df.columns:
+                    logger.debug("Fetched %d bars for %s via lumibot", len(df), symbol)
+                    return df
+        except Exception as exc:
+            logger.debug("lumibot fetch for %s failed: %s", symbol, exc)
+
+    # ── Path 2: direct ccxt call for Binance TradFi perpetuals (SPY, VIX, etc.) ──
+    # Binance's symbol format is e.g. SPY/USDT:USDT. Lumibot's get_historical_prices
+    # builds ``SPY/USDT`` (no colon), which doesn't match. So we go around it.
+    if symbol in ("SPY", "VIX") or symbol.endswith("PERP"):
+        try:
+            api = getattr(getattr(strategy, "broker", None), "api", None)
+            if api is not None and hasattr(api, "fetch_ohlcv"):
+                ccxt_symbol = f"{symbol}/USDT:USDT"
+                # SPY/VIX on Binance testnet only have ~10 daily bars. Use
+                # 1h bars to get more samples. We then resample to daily
+                # (close at end of UTC day) for the CrabQuant detector.
+                ccxt_timeframe = "1h"
+                ohlcv = api.fetch_ohlcv(
+                    ccxt_symbol, ccxt_timeframe, limit=min(1000, max(lookback * 4, 200))
+                )
+                if ohlcv:
+                    df = pd.DataFrame(
+                        ohlcv, columns=["datetime", "open", "high", "low", "close", "volume"]
+                    )
+                    df["datetime"] = pd.to_datetime(df["datetime"], unit="ms")
+                    df = df.set_index("datetime").sort_index()
+                    logger.info(
+                        "Fetched %d %s bars for %s via direct ccxt (%s)",
+                        len(df),
+                        ccxt_timeframe,
+                        symbol,
+                        ccxt_symbol,
+                    )
+                    return df
+        except Exception as exc:
+            logger.debug("Direct ccxt fetch for %s failed: %s", symbol, exc)
+
+    return None
 
 
 def detect_regime_tool(lookback: int = 50) -> dict[str, Any]:
@@ -60,38 +157,42 @@ def detect_regime_tool(lookback: int = 50) -> dict[str, Any]:
     from crabquant.regime import detect_regime
     from src.tools._strategy_context import get_strategy
 
+    # Import Asset for proper quote-asset binding (crypto brokers need
+    # Asset("USDT", "crypto") explicitly to resolve SPY/USDT:USDT)
+    try:
+        from lumibot.entities import Asset as LumiBotAsset
+    except ImportError:
+        LumiBotAsset = None  # type: ignore[assignment]
+
     strategy = get_strategy()
     if strategy is None:
         return {"regime": "unknown", "confidence": 0.0, "error": "No strategy registered"}
 
     try:
-        # Fetch SPY historical data
         end = strategy.get_datetime()
         start = end - timedelta(days=max(lookback * 3, 150))
-        spy_bars = strategy.get_historical_prices("SPY", length=lookback, timestep="day")
-        if spy_bars is None:
-            logger.warning("No SPY price data available — cannot detect regime")
-            return {
-                "regime": "unknown",
-                "confidence": 0.0,
-                "error": "No SPY price data available",
-            }
 
-        df_spy = spy_bars.df if hasattr(spy_bars, "df") else spy_bars
-        if df_spy is None or df_spy.empty or "close" not in df_spy.columns:
-            logger.warning("SPY data missing 'close' column or empty — cannot detect regime")
-            return {
-                "regime": "unknown",
-                "confidence": 0.0,
-                "error": "SPY data empty or missing close column",
-            }
+        df_spy = _fetch_regime_data(strategy, "SPY", lookback, LumiBotAsset)
+        if df_spy is None:
+            # Try BTC as a crypto-market proxy (the broker is crypto-only).
+            logger.info("SPY unavailable on this broker — falling back to BTC as crypto market proxy")
+            df_spy = _fetch_regime_data(strategy, "BTC", lookback, LumiBotAsset)
+            if df_spy is None:
+                logger.warning("No SPY/BTC price data available — cannot detect regime")
+                return {
+                    "regime": "unknown",
+                    "confidence": 0.0,
+                    "error": "No price data for SPY or BTC (proxy)",
+                }
 
-        # Fetch VIX data (optional — regime detection handles None gracefully)
+        # Fetch VIX data (optional — regime detection handles None gracefully).
+        # VIX is not available on most crypto brokers; if unavailable we proceed
+        # with SPY-only regime detection (CrabQuant handles vix_data=None fine).
         df_vix = None
         try:
-            vix_bars = strategy.get_historical_prices("VIX", length=lookback, timestep="day")
-            if vix_bars is not None:
-                df_vix = vix_bars.df if hasattr(vix_bars, "df") else vix_bars
+            vix_df = _fetch_regime_data(strategy, "VIX", lookback, LumiBotAsset)
+            if vix_df is not None:
+                df_vix = vix_df
         except Exception:
             logger.debug("VIX data unavailable — proceeding with SPY only", exc_info=True)
 
