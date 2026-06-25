@@ -218,10 +218,11 @@ class NexusCommitteeStrategy(Strategy):
         core_tools = self._load_core_tools()
         lakehouse_tools = self._load_lakehouse_tools()
         stratforge_tool = self._load_stratforge_tools()
+        regime_strategy_tools = self._load_regime_strategy_tools()  # B5 (+B3, B4)
 
         # All tools go to every agent except stratforge (PM only)
         all_read_tools = core_tools + lakehouse_tools
-        pm_tools = core_tools + lakehouse_tools + stratforge_tool
+        pm_tools = core_tools + lakehouse_tools + stratforge_tool + regime_strategy_tools
 
         # ── Create committee agents ──
         self.agents.create(
@@ -275,15 +276,19 @@ class NexusCommitteeStrategy(Strategy):
                 REMEMBER_DECISION,
                 REMEMBER_LESSON,
                 GET_MEMORY_STATS,
+                QUERY_WALKFORWARD_MEMORY,    # NEW (A2): walk-forward OOS evidence
+                REFRESH_WALKFORWARD_MEMORY, # NEW (A2): trigger weekly seed
             )
             from src.tools.evaluate_signal import EVALUATE_SIGNAL
             tools = [
                 DETECT_REGIME_TOOL,
                 SIGNAL_DASHBOARD,
                 QUERY_TRADE_MEMORY,
+                QUERY_WALKFORWARD_MEMORY,    # NEW
                 REMEMBER_DECISION,
                 REMEMBER_LESSON,
                 GET_MEMORY_STATS,
+                REFRESH_WALKFORWARD_MEMORY,  # NEW (admin: cron-friendly)
                 EVALUATE_SIGNAL,
             ]
             logger.info("Loaded %d core tools", len(tools))
@@ -333,6 +338,46 @@ class NexusCommitteeStrategy(Strategy):
         except Exception as exc:
             logger.warning("StratForge query tool not available: %s", exc)
             return []
+
+    def _load_regime_strategy_tools(self) -> list:
+        """Load regime→strategy tools (B5) for the PM agent.
+
+        Adds (B5 + supporting B3/B4 tools):
+        * ``lakehouse_strategy_for_regime_tool`` — Sortino-first ranked
+          strategies for a given (regime, asset) pair, with anti-leakage
+          ``as_of`` cutoff (B2/B5).
+        * ``query_counterfactuals_tool`` (B3) — what-if replay results for
+          recent HOLD bars so the PM sees the "you should have switched"
+          candidates.
+        * ``query_closed_loop_tool`` (B4) — view of actual vs counterfactual
+          per (strategy, symbol).
+        """
+        tools: list = []
+        try:
+            from src.tools.lakehouse_strategy_for_regime_tool import (
+                LAKEHOUSE_STRATEGY_FOR_REGIME,
+            )
+            tools.append(LAKEHOUSE_STRATEGY_FOR_REGIME)
+            logger.info("Loaded lakehouse_strategy_for_regime tool (B5)")
+        except Exception as exc:
+            logger.warning("lakehouse_strategy_for_regime not available: %s", exc)
+        try:
+            from src.tools.counterfactual_tool import (
+                QUERY_COUNTERFACTUALS,
+                RUN_COUNTERFACTUAL_REPLAY,
+            )
+            tools.append(QUERY_COUNTERFACTUALS)
+            tools.append(RUN_COUNTERFACTUAL_REPLAY)
+            logger.info("Loaded counterfactual tools (B3)")
+        except Exception as exc:
+            logger.warning("counterfactual tools not available: %s", exc)
+        try:
+            from src.tools.closed_loop_tool import QUERY_CLOSED_LOOP
+            tools.append(QUERY_CLOSED_LOOP)
+            logger.info("Loaded query_closed_loop tool (B4)")
+        except Exception as exc:
+            logger.warning("closed_loop tool not available: %s", exc)
+        return tools
 
     def _run_memory_bridge(self) -> None:
         """Sync LumiBot JSONL memory into vector memory via AQOS subprocess.

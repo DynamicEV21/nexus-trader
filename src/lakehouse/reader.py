@@ -395,21 +395,54 @@ class NexusLakehouseReader:
             clauses.append("regime_label = ?")
             params.append(regime_label)
         if min_sortino > 0:
-            # Columns vary: DuckLake uses avg_sortino / sortino_ratio / sortino.
-            # Use COALESCE so we hit whichever exists locally.
-            clauses.append(
-                "COALESCE(NULLIF(avg_sortino, 0), NULLIF(sortino_ratio, 0), "
-                "NULLIF(sortino, 0)) >= ?"
-            )
-            params.append(min_sortino)
+            # The local quant.duckdb v_nexus_regime_strategy_map uses
+            # ``sortino_ratio`` / ``sharpe_ratio``; DuckLake upstream uses
+            # ``avg_sortino`` / ``avg_sharpe``. We probe the columns first
+            # so the SQL doesn't reference non-existent columns (DuckDB
+            # does column-resolution at parse time, not execution).
+            try:
+                cols = self._con_get().execute(
+                    "DESCRIBE v_nexus_regime_strategy_map"
+                ).fetchall()
+                col_names = {c[0].lower() for c in cols}
+                if "sortino_ratio" in col_names:
+                    sortino_col = "sortino_ratio"
+                elif "avg_sortino" in col_names:
+                    sortino_col = "avg_sortino"
+                elif "sortino" in col_names:
+                    sortino_col = "sortino"
+                else:
+                    sortino_col = None
+            except Exception:
+                sortino_col = None
+            if sortino_col:
+                clauses.append(f"NULLIF({sortino_col}, 0) >= ?")
+                params.append(min_sortino)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
-        # Sortino column names vary by schema; order by COALESCE DESC NULLS LAST.
+        # Same probe for the ORDER BY column.
+        try:
+            cols = self._con_get().execute(
+                "DESCRIBE v_nexus_regime_strategy_map"
+            ).fetchall()
+            col_names = {c[0].lower() for c in cols}
+            if "sortino_ratio" in col_names:
+                sortino_col = "sortino_ratio"
+            elif "avg_sortino" in col_names:
+                sortino_col = "avg_sortino"
+            elif "sortino" in col_names:
+                sortino_col = "sortino"
+            else:
+                sortino_col = None
+        except Exception:
+            sortino_col = None
+        if sortino_col:
+            order_by = f"NULLIF({sortino_col}, 0) DESC NULLS LAST"
+        else:
+            order_by = "1"  # fallback: don't order
         return self._query(
             f"SELECT * FROM v_nexus_regime_strategy_map {where} "
-            f"ORDER BY COALESCE(NULLIF(avg_sortino, 0), "
-            f"NULLIF(sortino_ratio, 0), NULLIF(sortino, 0)) DESC NULLS LAST "
-            f"LIMIT ?",
+            f"ORDER BY {order_by} LIMIT ?",
             params,
         )
 
