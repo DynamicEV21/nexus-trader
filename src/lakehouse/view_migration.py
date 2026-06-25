@@ -39,21 +39,28 @@ logger = logging.getLogger(__name__)
 # migration tries them in order and uses the first that succeeds.
 NEXUS_CURATED_VIEW_DDL: list[list[str]] = [
     # 5. Regime-strategy mapping: which strategies historically work in which
-    # regimes. Upstream uses sample_count + avg_sharpe; the local table has
-    # n_trades + sharpe_ratio. Try upstream first (DuckLake), fall back to
-    # local names (quant.duckdb).
+    # regimes. Upstream uses sample_count + avg_sharpe + avg_sortino; the
+    # local table has n_trades + sharpe_ratio + sortino_ratio. Sortino is
+    # the primary ranking metric (penalizes only downside volatility, which
+    # is what we care about for asymmetric crypto payoffs). Sharpe is the
+    # tiebreaker when two strategies share the same Sortino (rare but
+    # useful when a strategy's downside is constant and Sortino rounds).
+    # Try upstream first (DuckLake), fall back to local names (quant.duckdb).
     [
         """
         CREATE OR REPLACE VIEW v_nexus_regime_strategy_map AS
         SELECT * FROM regime_strategy_map
-        WHERE sample_count >= 5 AND avg_sharpe > 0
-        ORDER BY avg_sharpe DESC
+        WHERE sample_count >= 5 AND avg_sortino IS NOT NULL AND avg_sortino > 0
+        ORDER BY avg_sortino DESC NULLS LAST, avg_sharpe DESC NULLS LAST
         """,
         """
         CREATE OR REPLACE VIEW v_nexus_regime_strategy_map AS
         SELECT * FROM regime_strategy_map
-        WHERE n_trades >= 5 AND sharpe_ratio > 0
-        ORDER BY sharpe_ratio DESC
+        WHERE n_trades >= 5
+          AND sharpe_ratio IS NOT NULL
+          AND sortino_ratio IS NOT NULL
+          AND sortino_ratio > 0
+        ORDER BY sortino_ratio DESC NULLS LAST, sharpe_ratio DESC NULLS LAST
         """,
     ],
     # 6. Catalyst digest — latest catalyst grades
