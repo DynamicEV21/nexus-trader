@@ -119,6 +119,7 @@ def lakehouse_strategy_candidates(
     regime: str = "",
     min_composite: float = 49.0,
     min_sharpe: float = 0.0,
+    min_sortino: float = 0.0,
     ticker: str = "",
     limit: int = 10,
 ) -> dict[str, Any]:
@@ -127,26 +128,73 @@ def lakehouse_strategy_candidates(
     Returns strategies from the corrected ``v_nexus_strategy_pool`` view
     which reads from ``backtest_results_v2`` (crypto strategies only).
 
+    Sortino is the headline ranking metric (penalizes only downside vol,
+    which is the risk that actually hurts PnL for long-biased crypto).
+    Sharpe is the tiebreaker. If the upstream table only has a Sharpe
+    column (no Sortino yet), the function falls back to Sharpe-only and
+    the returned dict carries ``note: 'sharpe_only'`` so the calling
+    agent can flag the data quality.
+
     Args:
         regime: Optional regime label filter (blank = all regimes).
         min_composite: Minimum composite score (default 49.0, the WF gate).
-        min_sharpe: Minimum in-sample Sharpe ratio.
+        min_sharpe: Minimum in-sample Sharpe ratio (legacy filter).
+        min_sortino: Minimum in-sample Sortino ratio (NEW, default 0.0 =
+            no filter; e.g. 0.5 to require Sortino > 0.5).
         ticker: Filter by ticker (e.g. 'BTC').
         limit: Max strategies to return.
 
     Returns:
-        dict with ``strategies`` list and ``count``.
+        dict with ``strategies`` list (each row carries ``sortino`` as
+        the headline + ``sharpe`` as tiebreaker + ``sortino_headline``
+        flag + ``note`` if fallback was used), ``count``, and ``note``
+        if the result is Sharpe-only.
     """
     try:
         reader = _get_reader()
+        # Sortino-first ranking by default — the reader's ORDER BY clause
+        # is "sortino DESC NULLS LAST, sharpe DESC NULLS LAST, composite_score DESC NULLS LAST".
+        # ``sort_by='sortino'`` is now the default in the reader; pass it
+        # explicitly so this function is self-documenting.
         strategies = reader.get_strategy_pool(
             regime_label=regime,
             min_composite=min_composite,
             min_sharpe=min_sharpe,
+            min_sortino=min_sortino,
             ticker=ticker,
+            sort_by="sortino",
             limit=limit,
         )
-        return {"strategies": strategies, "count": len(strategies)}
+
+        # Detect whether the upstream table is Sharpe-only (no Sortino
+        # column populated). If every row has a NULL sortino, the data
+        # is "sharpe_only" — flag it so the LLM knows the ranking is
+        # by Sharpe and the Sortino commentary in the PM prompt is
+        # inapplicable to this batch.
+        sharpe_only = bool(strategies) and all(
+            row.get("sortino") is None for row in strategies
+        )
+
+        # Surface Sortino as the headline metric in each row. The reader
+        # already returns the row dict with ``sortino`` and ``sharpe``
+        # columns; we just normalize the field name and add a flag so
+        # downstream agents can pin the primary metric without parsing.
+        for row in strategies:
+            row.setdefault("sortino", row.get("sortino"))
+            row.setdefault("sharpe", row.get("sharpe"))
+            row["sortino_headline"] = (
+                row.get("sortino") if not sharpe_only else None
+            )
+            if sharpe_only:
+                row["note"] = "sharpe_only"
+
+        result: dict[str, Any] = {
+            "strategies": strategies,
+            "count": len(strategies),
+        }
+        if sharpe_only:
+            result["note"] = "sharpe_only"
+        return result
     except Exception as exc:
         logger.warning("lakehouse_strategy_candidates() failed: %s", exc)
         return {"strategies": [], "count": 0, "error": str(exc)}
@@ -378,9 +426,12 @@ try:
         description=(
             "Get validated crypto strategy candidates from the lakehouse. "
             "Returns strategies from backtest_results_v2 (BTC, ETH, SOL, ALL, MULTI) "
-            "ranked by composite score. All strategies have composite >= 49 "
-            "and status winner or tested. Use to find the best strategies "
-            "for the current market regime."
+            "ranked **Sortino-first** (penalizes only downside volatility — "
+            "the risk that actually hurts a long-biased book), then Sharpe "
+            "as tiebreaker, then composite score. All strategies have "
+            "composite >= 49 and status winner or tested. If the upstream "
+            "table is Sharpe-only, the response includes `note: 'sharpe_only'`. "
+            "Use to find the best strategies for the current market regime."
         ),
     )(lakehouse_strategy_candidates)
 
