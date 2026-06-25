@@ -91,6 +91,12 @@ def load_strategy_fn(strategy_name: str):
 def get_wf_validated_strategies() -> dict:
     """Get the best WF-validated strategy per asset from nexus_results.duckdb.
 
+    B6 (2026-06-25) — additionally filter by strategy_gate_results:
+    only strategies with a passing strategy_gate_results row from the
+    last 30 days AND matching the default gates profile are considered.
+    This is the pre-load gate that catches stale data, wrong metrics,
+    and under-performers before they reach the live committee.
+
     Sortino-first ranking: penalizes only downside volatility (the risk
     that actually hurts PnL for long-biased crypto). Sharpe is the
     tiebreaker. Falls back to Sharpe-only ranking when the
@@ -234,6 +240,85 @@ def get_wf_validated_strategies() -> dict:
     for asset, cfg in PORTFOLIO.items():
         if asset not in result:
             result[asset] = cfg["default_strategy"]
+
+    # ── B6 Strategy Validation Gate filter ──
+    # Only load strategies that have a passing strategy_gate_results row
+    # from the last 30 days AND matching the default gates profile.
+    # Strategies without a recent gate row are excluded (gate must be
+    # run via `python -m src.validation.strategy_gate <name>` before
+    # the strategy can be deployed).
+    try:
+        gate_con = duckdb.connect(db_path, read_only=True)
+        try:
+            # Probe whether the strategy_gate_results table exists.
+            try:
+                gate_con.execute(
+                    "SELECT 1 FROM strategy_gate_results LIMIT 1"
+                ).fetchone()
+            except Exception:
+                logger.info(
+                    "strategy_gate_results table missing — skipping B6 gate "
+                    "filter (gate results won't be enforced until first run)"
+                )
+                return result
+
+            gate_rows = gate_con.execute(
+                """
+                SELECT strategy_name, MAX(ran_at) AS last_passed
+                FROM strategy_gate_results
+                WHERE passed = TRUE
+                  AND gates_profile = 'default'
+                  AND ran_at >= NOW() - INTERVAL '30 days'
+                GROUP BY strategy_name
+                """,
+            ).fetchall()
+            gate_passed = {name: str(last) for name, last in gate_rows}
+            if gate_passed:
+                filtered = {
+                    sym: strat for sym, strat in result.items()
+                    if strat in gate_passed
+                }
+                excluded = set(result) - set(filtered)
+                if excluded:
+                    logger.info(
+                        "B6 gate filter: excluded %d strategies without recent "
+                        "passing strategy_gate_results row: %s",
+                        len(excluded), sorted(excluded),
+                    )
+                # Fall back to default for excluded symbols (skip symbols
+                # that aren't in PORTFOLIO — they're 3rd-party additions).
+                for sym in excluded:
+                    if sym in PORTFOLIO:
+                        result[sym] = PORTFOLIO[sym]["default_strategy"]
+            else:
+                # No passing rows at all — could mean:
+                # (a) the gate has never been run, or
+                # (b) all current top strategies are below threshold.
+                # We enforce the gate anyway: any strategy whose
+                # name doesn't appear in strategy_gate_results.passed
+                # is excluded. This forces operators to re-run the gate
+                # after parameter changes.
+                logger.info(
+                    "B6 gate filter: no passing strategy_gate_results rows in last "
+                    "30 days for any strategy; falling back to defaults for all symbols. "
+                    "Run `python -m src.validation.strategy_gate <name>` to enable."
+                )
+                for sym in list(result.keys()):
+                    if sym in PORTFOLIO:
+                        result[sym] = PORTFOLIO[sym]["default_strategy"]
+                    else:
+                        # Symbol isn't in PORTFOLIO — leave the WF-picked
+                        # strategy as-is (3rd-party addition).
+                        logger.debug(
+                            "B6 gate filter: keeping %s (not in PORTFOLIO)",
+                            sym,
+                        )
+        finally:
+            gate_con.close()
+    except Exception as exc:
+        logger.warning(
+            "B6 gate filter failed (%s) — proceeding without gate filter", exc,
+        )
 
     return result
 
