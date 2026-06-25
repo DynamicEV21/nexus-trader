@@ -380,7 +380,9 @@ class StratForgeBridge:
         """Record a walk-forward validation summary row.
 
         ``wf_row`` should contain keys matching the ``walk_forward_results``
-        schema. Creates the table if it does not exist.
+        schema. Creates the table if it does not exist. Includes both
+        ``sharpe`` and ``sortino`` (Sortino is the primary ranking metric
+        for crypto OOS evaluation; Sharpe is kept as a tiebreaker).
         """
         con = self._write_con
         con.execute(
@@ -396,6 +398,7 @@ class StratForgeBridge:
                 test_end DATE,
                 total_return_pct DOUBLE,
                 sharpe DOUBLE,
+                sortino DOUBLE,
                 max_drawdown_pct DOUBLE,
                 profitable BOOLEAN,
                 num_entries INTEGER,
@@ -405,15 +408,28 @@ class StratForgeBridge:
             );
             """
         )
+        # Defensive: if the table was created earlier without a sortino column,
+        # add it (idempotent ALTER).
+        try:
+            cols = {row[1] for row in con.execute(
+                "PRAGMA table_info(walk_forward_results)"
+            ).fetchall()}
+            if "sortino" not in cols:
+                con.execute(
+                    "ALTER TABLE walk_forward_results ADD COLUMN sortino DOUBLE"
+                )
+        except Exception as exc:
+            logger.debug("sortino column add skipped: %s", exc)
+
         try:
             result = con.execute(
                 """
                 INSERT INTO walk_forward_results (
                     strategy_name, symbol, window_index,
                     train_start, train_end, test_start, test_end,
-                    total_return_pct, sharpe, max_drawdown_pct, profitable,
+                    total_return_pct, sharpe, sortino, max_drawdown_pct, profitable,
                     num_entries, budget
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING id
                 """,
                 [
@@ -426,6 +442,7 @@ class StratForgeBridge:
                     wf_row.get("test_end"),
                     wf_row.get("total_return_pct"),
                     wf_row.get("sharpe"),
+                    wf_row.get("sortino"),  # NEW: Sortino alongside Sharpe
                     wf_row.get("max_drawdown_pct"),
                     wf_row.get("profitable"),
                     wf_row.get("num_entries"),

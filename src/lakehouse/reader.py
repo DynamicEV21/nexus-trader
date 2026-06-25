@@ -228,7 +228,9 @@ class NexusLakehouseReader:
         regime_label: str = "",
         min_composite: float = 49.0,
         min_sharpe: float = 0.0,
+        min_sortino: float = 0.0,
         ticker: str = "",
+        sort_by: str = "sortino",
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         """Validated crypto strategies from v_nexus_strategy_pool.
@@ -237,11 +239,20 @@ class NexusLakehouseReader:
         crypto-relevant tickers (BTC, ETH, SOL, ALL, MULTI) with
         ``composite_score >= 49`` and ``status IN ('winner', 'tested')``.
 
+        Default ranking is by Sortino (penalizes only downside volatility —
+        better metric than Sharpe for asymmetric crypto payoffs where upside
+        vol is welcomed). Falls back to Sharpe when Sortino is NULL,
+        then to composite_score.
+
         Args:
             regime_label: Filter by regime_best_tag or regime_label.
             min_composite: Minimum composite score (default 49.0, the WF gate).
             min_sharpe: Minimum in-sample Sharpe ratio.
+            min_sortino: Minimum in-sample Sortino ratio (NEW, default 0 = no
+                filter; e.g. 0.5 = only return strategies with Sortino > 0.5).
             ticker: Filter by ticker (e.g. 'BTC').
+            sort_by: Ranking key — ``"sortino"`` (default), ``"sharpe"``, or
+                ``"composite"``.
             limit: Max results.
         """
         clauses: list[str] = []
@@ -252,6 +263,9 @@ class NexusLakehouseReader:
         if min_sharpe > 0:
             clauses.append("sharpe >= ?")
             params.append(min_sharpe)
+        if min_sortino > 0:
+            clauses.append("sortino IS NOT NULL AND sortino >= ?")
+            params.append(min_sortino)
         if ticker:
             clauses.append("ticker = ?")
             params.append(ticker)
@@ -259,10 +273,20 @@ class NexusLakehouseReader:
             clauses.append("(regime_best_tag = ? OR regime_label = ?)")
             params.extend([regime_label, regime_label])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        # Map sort_by to a SQL ORDER BY clause. Sortino DESC NULLS LAST is
+        # the canonical ranking for crypto strategies: penalizes only downside
+        # volatility, which is the risk that matters to a long-biased committee.
+        order_by_map: dict[str, str] = {
+            "sortino": "sortino DESC NULLS LAST, sharpe DESC NULLS LAST, composite_score DESC NULLS LAST",
+            "sharpe": "sharpe DESC NULLS LAST, sortino DESC NULLS LAST, composite_score DESC NULLS LAST",
+            "composite": "composite_score DESC NULLS LAST, sortino DESC NULLS LAST",
+        }
+        order_by = order_by_map.get(sort_by, order_by_map["sortino"])
         params.append(limit)
         return self._query(
             f"SELECT * FROM v_nexus_strategy_pool {where} "
-            f"ORDER BY composite_score DESC NULLS LAST LIMIT ?", params
+            f"ORDER BY {order_by} LIMIT ?", params
         )
 
     # ── Catalyst ────────────────────────────────────────────────────
@@ -316,13 +340,57 @@ class NexusLakehouseReader:
     def get_regime_strategy_map(
         self, regime_label: str = "",
     ) -> list[dict[str, Any]]:
-        """Regime-strategy performance mapping from v_nexus_regime_strategy_map."""
+        """Regime-strategy performance mapping from v_nexus_regime_strategy_map.
+
+        The view is sorted by Sortino (penalizes only downside volatility)
+        over Sharpe — see view_migration.NEXUS_CURATED_VIEW_DDL.
+        """
         if regime_label:
             return self._query(
                 "SELECT * FROM v_nexus_regime_strategy_map WHERE regime_label = ?",
                 [regime_label],
             )
         return self._query("SELECT * FROM v_nexus_regime_strategy_map")
+
+    def get_top_regime_strategies_by_sortino(
+        self, regime_label: str = "", min_sortino: float = 0.0, limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Top strategies for a given regime, ranked by Sortino.
+
+        Sortino is the primary ranking metric for crypto (penalizes only
+        downside volatility; we welcome upside vol). This is a thin wrapper
+        over ``v_nexus_regime_strategy_map`` that re-orders in SQL (the view
+        itself is also Sortino-ordered, but we re-rank defensively in case
+        upstream changes).
+
+        Args:
+            regime_label: Filter by regime (empty = all regimes).
+            min_sortino: Minimum Sortino ratio filter (0 = no filter).
+            limit: Max results.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if regime_label:
+            clauses.append("regime_label = ?")
+            params.append(regime_label)
+        if min_sortino > 0:
+            # Columns vary: DuckLake uses avg_sortino / sortino_ratio / sortino.
+            # Use COALESCE so we hit whichever exists locally.
+            clauses.append(
+                "COALESCE(NULLIF(avg_sortino, 0), NULLIF(sortino_ratio, 0), "
+                "NULLIF(sortino, 0)) >= ?"
+            )
+            params.append(min_sortino)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        # Sortino column names vary by schema; order by COALESCE DESC NULLS LAST.
+        return self._query(
+            f"SELECT * FROM v_nexus_regime_strategy_map {where} "
+            f"ORDER BY COALESCE(NULLIF(avg_sortino, 0), "
+            f"NULLIF(sortino_ratio, 0), NULLIF(sortino, 0)) DESC NULLS LAST "
+            f"LIMIT ?",
+            params,
+        )
 
     # ── Full Intelligence Packet ───────────────────────────────────
 
