@@ -223,6 +223,32 @@ class NexusVectorMemory:
 
             if self._decisions_table_name in existing_tables:
                 self._decisions_table = self._db.open_table(self._decisions_table_name)
+                # Idempotent column-add migration for legacy tables that
+                # pre-date the B2/A3 anti-leakage fields. LanceDB's
+                # ``add_columns`` API requires a pyarrow schema (dict and
+                # list-of-dict forms both fail in lancedb 0.33 with a SQL
+                # parser error). We lazily import pyarrow here so the
+                # module still loads in environments where pyarrow isn't
+                # installed (rare, since lancedb requires it).
+                try:
+                    import pyarrow as _pa  # type: ignore[import-untyped]
+                    existing_cols = set(self._decisions_table.schema.names)
+                    if "decision_sim_time" not in existing_cols:
+                        self._decisions_table.add_columns(
+                            _pa.schema([
+                                _pa.field(
+                                    "decision_sim_time", _pa.string()
+                                ),
+                            ])
+                        )
+                        logger.info(
+                            "Added 'decision_sim_time' column to "
+                            "nexus_decisions (B2 anti-leakage migration)"
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "decision_sim_time migration attempt: %s", exc
+                    )
             else:
                 self._decisions_table = self._db.create_table(
                     self._decisions_table_name,
@@ -545,6 +571,13 @@ class NexusVectorMemory:
                             outcome=dec.get("outcome", "pending"),
                             pnl_pct=float(dec.get("pnl_pct", 0.0)),
                             timestamp=dec.get("timestamp", ""),
+                            # B2 anti-leakage (A3): stamp the sim-time the
+                            # decision was actually made at. Falls back to
+                            # ``timestamp`` if the caller didn't provide one.
+                            decision_sim_time=(
+                                dec.get("decision_sim_time", "")
+                                or dec.get("timestamp", "")
+                            ),
                             strategy_name=dec.get("strategy_name", "Nexus_Trader"),
                             backtest_id=dec.get("backtest_id", ""),
                         )

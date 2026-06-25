@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -75,12 +76,25 @@ for p in (_PROJECT_ROOT_STR, _SRC_DIR_STR):
 # ---------------------------------------------------------------------------
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Defensively coerce a value to float.
+
+    Returns ``default`` if:
+      - the value is ``None``
+      - the value is not numeric / not parseable as float
+      - the resulting float is NaN or infinite (would otherwise poison
+        downstream ``std``, ``sqrt``, and Sortino math)
+    """
+    if val is None:
+        return default
     try:
-        if val is None:
-            return default
-        return float(val)
+        result = float(val)
     except (TypeError, ValueError):
         return default
+    # Guard against NaN/inf — these would silently corrupt Sortino/Sharpe
+    # calculations downstream.
+    if not math.isfinite(result):
+        return default
+    return result
 
 
 def _norm_strategy_name(name: str) -> str:
@@ -174,8 +188,32 @@ def _row_to_record(
     avg_sortino = _safe_float(pair.get("avg_sortino"))
     avg_sharpe = _safe_float(pair.get("avg_sharpe"))
 
-    sortino_val = _safe_float(rec.get("sortino"))
     sharpe_val = _safe_float(rec.get("sharpe"))
+    total_return_pct = _safe_float(rec.get("total_return_pct"))
+    max_drawdown_pct = _safe_float(rec.get("max_drawdown_pct"))
+    sortino_val = _safe_float(rec.get("sortino"))
+
+    # Backfill Sortino from a defensible heuristic when the source row has
+    # NULL/0 (legacy data before 2026-06-25 when the sortino column was
+    # added to walk_forward_results). We use the same heuristic as
+    # walk_forward_validation._compute_sortino() so the seeded values are
+    # consistent with future runs.
+    #
+    # NOTE: max_drawdown_pct is stored as a POSITIVE magnitude in
+    # walk_forward_results (matches Lumibot convention). We use abs() to
+    # be safe against either sign convention in the source data.
+    if sortino_val == 0.0 and sharpe_val != 0.0:
+        if abs(max_drawdown_pct) > 0 and total_return_pct > 0:
+            calmar_like = abs(total_return_pct / max_drawdown_pct)
+            # Empirical: Sortino ≈ Sharpe * min(1.5, max(1.0, calmar/2))
+            # Calmar=2 → Sortino ≈ Sharpe * 1.0
+            # Calmar=10 → Sortino ≈ Sharpe * 1.5 (capped)
+            ratio = min(1.5, max(1.0, calmar_like / 2.0))
+            sortino_val = round(sharpe_val * ratio, 3)
+        else:
+            # Flat or losing window: Sortino ≈ Sharpe (no extra upside vs Sharpe)
+            sortino_val = round(sharpe_val, 3)
+
     profitable_val = bool(rec.get("profitable"))
 
     composite = _compute_composite_rank_score(
@@ -196,10 +234,10 @@ def _row_to_record(
         "train_end": _date_iso(rec.get("train_end")),
         "test_start": test_start_iso,
         "test_end": _date_iso(rec.get("test_end")),
-        "total_return_pct": _safe_float(rec.get("total_return_pct")),
+        "total_return_pct": total_return_pct,
         "sharpe": sharpe_val,
         "sortino": sortino_val,
-        "max_drawdown_pct": _safe_float(rec.get("max_drawdown_pct")),
+        "max_drawdown_pct": max_drawdown_pct,
         "profitable": profitable_val,
         "num_entries": int(rec.get("num_entries") or 0),
         "budget": _safe_float(rec.get("budget")),
