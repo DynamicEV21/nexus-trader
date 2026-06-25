@@ -61,10 +61,12 @@ from pathlib import Path
 LUMIBOT_ROOT = Path("/home/Zev/development/trading-bots/lumibot")
 NEXUS_ROOT = Path("/home/Zev/development/nexus-trade")
 
-# LumiBot first (so lumibot.components wins over any local conflict),
-# nexus-trade/src second so our strategies/tools resolve.
+# LumiBot first (so lumibot.components wins over any local conflict).
+# Insert NEXUS_ROOT (the parent of the top-level `src` package), not
+# NEXUS_ROOT/src — Python needs the package's parent on sys.path so that
+# `import src.strategies.nexus_committee` resolves.
 sys.path.insert(0, str(LUMIBOT_ROOT))
-sys.path.insert(0, str(NEXUS_ROOT / "src"))
+sys.path.insert(0, str(NEXUS_ROOT))
 
 from dotenv import load_dotenv
 

@@ -44,6 +44,7 @@ Usage (paper trading):
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
