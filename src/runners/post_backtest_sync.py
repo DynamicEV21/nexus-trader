@@ -32,10 +32,18 @@ import json
 import logging
 import os
 import re
+import subprocess  # NEW (A3): used by _replay_trades_to_lancedb subprocess bridge
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+try:
+    import pandas as pd
+except ImportError:
+    # pandas is required for parquet reads. Defer error to call site so the
+    # module still imports in the AQOS venv where pandas is installed.
+    pd = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +59,24 @@ _LOGS_DIR = _PROJECT_ROOT / "logs"
 _DUCKDB_PATH = _PROJECT_ROOT / "data" / "nexus_results.duckdb"
 
 # ---------------------------------------------------------------------------
-# Schema DDL
+# A3 (2026-06-25): backtest replay → nexus_decisions.lance
+#
+# For each closed round-trip trade (BUY → SELL), write a NexusDecisionRecord
+# into the vector memory with:
+#   - decision_sim_time  = the BUY bar time (when the trade was *decided*;
+#                          this is the boundary the LLM was reasoning at).
+#   - outcome            = "win" if realized_pnl > 0, else "loss".
+#   - pnl_pct            = realized_pnl as % of entry notional.
+#
+# B2 anti-leakage: a backtest replay at sim-bar T must only see trades that
+# were DECIDED at sim-bars <= T. We project the buy-bar datetime into
+# ``decision_sim_time`` so the recall query's pre-filter
+# (``decision_sim_time <= as_of_sim_time``) works correctly during future
+# backtest replays.
 # ---------------------------------------------------------------------------
+_REPLAY_FLAG = os.environ.get("NEXUS_BACKTEST_REPLAY", "1") == "1"
+_AQOS_VENV_PY = "/home/Zev/development/agentic-quant-os/.venv/bin/python"
+_AQOS_PYTHONPATH = "/home/Zev/development/nexus-trade/src"
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS backtest_runs (
@@ -72,15 +96,25 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
 );
 
 CREATE TABLE IF NOT EXISTS backtest_trades (
-    run_id           VARCHAR,
-    event_timestamp  TIMESTAMP,
-    symbol           VARCHAR,
-    side             VARCHAR,
-    filled_quantity  DOUBLE,
-    price            DOUBLE,
-    trade_cost       DOUBLE,
-    asset_type       VARCHAR,
-    event_kind       VARCHAR
+    run_id            VARCHAR,
+    event_timestamp   TIMESTAMP,
+    symbol            VARCHAR,
+    side              VARCHAR,
+    filled_quantity   DOUBLE,
+    price             DOUBLE,
+    trade_cost        DOUBLE,
+    asset_type        VARCHAR,
+    event_kind        VARCHAR,
+    -- A3 (2026-06-25): memory replay fields. ``decision_sim_time`` is the
+    -- BUY-bar datetime (the boundary the trade was *decided* at). It equals
+    -- ``event_timestamp`` for BUY rows; for SELL rows it equals the matched
+    -- BUY row's bar time. ``outcome`` is "win" / "loss" / "pending" once
+    -- a round-trip closes. ``pnl_pct`` is the realized PnL as % of entry
+    -- notional. ``round_trip_id`` groups entry+exit into a single decision.
+    decision_sim_time TIMESTAMP,
+    outcome           VARCHAR,
+    pnl_pct           DOUBLE,
+    round_trip_id     VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS agent_observations (
@@ -128,6 +162,23 @@ def _parse_run_id(filename: str) -> str:
     return filename.rsplit(".", 1)[0]
 
 
+def _strategy_from_run_id(run_id: str) -> str:
+    """Extract the strategy name from a run_id (everything before the date).
+
+    Example: "NexusCommitteeStrategy_2026-06-23_11-59_q3d6Ko"
+             → "NexusCommitteeStrategy"
+    """
+    m = _RUN_ID_RE.match(f"{run_id}_stats")
+    if m:
+        return m.group("strategy")
+    # Fallback: split on the first underscore followed by 4-digit year
+    parts = run_id.split("_")
+    for i, p in enumerate(parts):
+        if len(p) == 4 and p.isdigit() and p.startswith(("19", "20")):
+            return "_".join(parts[:i])
+    return run_id.split("_")[0] if run_id else "unknown_strategy"
+
+
 def _find_artifact(logs_dir: Path, run_id: str, artifact: str) -> Path | None:
     """Find a specific artifact file for a given run_id."""
     pattern = f"{run_id}_{artifact}"
@@ -154,13 +205,55 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
 # ---------------------------------------------------------------------------
 
 def ensure_schema(db_path: Path | None = None) -> None:
-    """Create the 3 tables if they don't exist."""
+    """Create the 3 tables if they don't exist, plus idempotent migrations.
+
+    Migrations (run on every call; safe because each is idempotent):
+      * backtest_trades: add ``decision_sim_time``, ``outcome``, ``pnl_pct``,
+        ``round_trip_id`` columns for A3 backtest replay.
+      * backtest_runs: add ``sortino`` column for A1 Sortino-first ranking.
+    """
     import duckdb
     path = db_path or _DUCKDB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(path))
     try:
         con.execute(_SCHEMA_SQL)
+        # Idempotent ALTERs for legacy tables that pre-date A1/A3 columns.
+        # DuckDB doesn't support ``ADD COLUMN IF NOT EXISTS`` reliably across
+        # versions, so we introspect the schema first.
+        try:
+            bt_cols = {
+                row[0]
+                for row in con.execute(
+                    "PRAGMA table_info(backtest_trades)"
+                ).fetchall()
+            }
+            if "decision_sim_time" not in bt_cols:
+                con.execute("ALTER TABLE backtest_trades ADD COLUMN decision_sim_time TIMESTAMP")
+                logger.info("backtest_trades: added 'decision_sim_time' column")
+            if "outcome" not in bt_cols:
+                con.execute("ALTER TABLE backtest_trades ADD COLUMN outcome VARCHAR")
+                logger.info("backtest_trades: added 'outcome' column")
+            if "pnl_pct" not in bt_cols:
+                con.execute("ALTER TABLE backtest_trades ADD COLUMN pnl_pct DOUBLE")
+                logger.info("backtest_trades: added 'pnl_pct' column")
+            if "round_trip_id" not in bt_cols:
+                con.execute("ALTER TABLE backtest_trades ADD COLUMN round_trip_id VARCHAR")
+                logger.info("backtest_trades: added 'round_trip_id' column")
+        except Exception as exc:
+            logger.debug("backtest_trades migration skipped: %s", exc)
+        try:
+            br_cols = {
+                row[0]
+                for row in con.execute(
+                    "PRAGMA table_info(backtest_runs)"
+                ).fetchall()
+            }
+            if "sortino" not in br_cols:
+                con.execute("ALTER TABLE backtest_runs ADD COLUMN sortino DOUBLE")
+                logger.info("backtest_runs: added 'sortino' column")
+        except Exception as exc:
+            logger.debug("backtest_runs migration skipped: %s", exc)
         logger.info("Schema ensured in %s", path)
     finally:
         con.close()
@@ -279,8 +372,354 @@ def _sync_stats(con, logs_dir: Path, run_id: str) -> int:
     return 1
 
 
+# ---------------------------------------------------------------------------
+# A3 helpers — backtest trade replay to nexus_decisions.lance
+# ---------------------------------------------------------------------------
+
+def _project_trades_to_round_trips(
+    df: "pd.DataFrame",
+    run_id: str,
+) -> list[dict[str, Any]]:
+    """Convert a LumiBot trades.parquet into closed round-trip records.
+
+    LumiBot's trades.parquet has one row per FILL event. A round-trip is a
+    BUY (entry) followed by a SELL (exit) on the same symbol. We use FIFO
+    matching: each BUY opens a position; the next SELL closes the oldest
+    open BUY at the matching quantity.
+
+    The committee strategy currently doesn't execute trades (so
+    trades.parquet is empty), but algo-bot backtests do produce trades
+    and this routine must handle them correctly.
+
+    Returns
+    -------
+    list[dict]
+        Each dict has keys:
+            run_id, decision_id, decision_sim_time, symbol, action,
+            side, filled_quantity, entry_price, exit_price, entry_time,
+            exit_time, pnl_pct, outcome, regime, indicators_snapshot
+        Open (unclosed) positions get outcome="pending" and pnl_pct=0.0.
+    """
+    if df is None or df.empty:
+        return []
+
+    # Schema tolerance: LumiBot column names vary across versions. Lowercase
+    # the columns we care about and remap common variants.
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    rename_map = {
+        "filled_quantity": "filled_quantity",
+        "asset.symbol": "symbol_alias",  # legacy; rarely present
+        "event_timestamp": "time",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    # Normalize symbol: prefer row.symbol, fall back to asset.symbol
+    if "symbol" not in df.columns and "asset.symbol" in df.columns:
+        df["symbol"] = df["asset.symbol"]
+
+    # Normalize time to datetime
+    if "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        df = df.dropna(subset=["time"])
+    else:
+        return []  # no time column = no replayable events
+
+    df = df.sort_values("time").reset_index(drop=True)
+
+    # Per-symbol FIFO matching of buy → sell.
+    open_positions: dict[str, list[dict[str, Any]]] = {}
+    records: list[dict[str, Any]] = []
+
+    # Best-effort regime hint: pull from the run's settings.json or detect
+    # from the price action. We use "backtest" as the safe default — the
+    # real regime classification would require running the full detector.
+    regime = "backtest"
+
+    for _, row in df.iterrows():
+        side = str(row.get("side", "")).lower()
+        sym = str(row.get("symbol", "") or "")
+        qty = _safe_float(row.get("filled_quantity"))
+        price = _safe_float(row.get("price"))
+        ts = row.get("time")
+        if pd.isna(ts):
+            continue
+        if not sym or qty <= 0 or price <= 0:
+            continue
+
+        if side in ("buy", "bot"):
+            # Open a new position
+            open_positions.setdefault(sym, []).append(
+                {"entry_time": ts, "entry_price": price, "qty": qty}
+            )
+        elif side in ("sell", "sold"):
+            # FIFO close against oldest open position for this symbol
+            queue = open_positions.get(sym, [])
+            if not queue:
+                # Short or orphan close — record as standalone event with
+                # unknown entry. Use the close time as decision_sim_time
+                # so the recall filter still works.
+                records.append({
+                    "run_id": run_id,
+                    "decision_id": f"{run_id}_short_{ts.isoformat()}_{sym}",
+                    "decision_sim_time": ts,
+                    "symbol": sym,
+                    "action": "sell",
+                    "side": "sell",
+                    "filled_quantity": qty,
+                    "entry_price": 0.0,
+                    "exit_price": price,
+                    "entry_time": None,
+                    "exit_time": ts,
+                    "pnl_pct": 0.0,
+                    "outcome": "pending",
+                    "regime": regime,
+                    "indicators_snapshot": "{}",
+                })
+                continue
+
+            entry = queue[0]
+            entry_qty = entry["qty"]
+            match_qty = min(entry_qty, qty)
+
+            # Realized PnL as % of entry notional
+            entry_notional = match_qty * entry["entry_price"]
+            pnl_pct = 0.0
+            if entry_notional > 0:
+                pnl_pct = ((price - entry["entry_price"]) / entry["entry_price"]) * 100.0
+
+            outcome = "win" if pnl_pct > 0 else "loss"
+
+            rt_id = f"{run_id}_rt_{entry['entry_time'].isoformat()}_{sym}"
+            records.append({
+                "run_id": run_id,
+                "decision_id": f"{rt_id}_dec",
+                "decision_sim_time": entry["entry_time"],  # boundary the trade was decided at
+                "symbol": sym,
+                "action": "buy",  # original decision was BUY
+                "side": "sell",  # this fill is the exit
+                "filled_quantity": match_qty,
+                "entry_price": entry["entry_price"],
+                "exit_price": price,
+                "entry_time": entry["entry_time"],
+                "exit_time": ts,
+                "pnl_pct": round(pnl_pct, 4),
+                "outcome": outcome,
+                "regime": regime,
+                "indicators_snapshot": "{}",
+            })
+
+            # Decrement the queue
+            if match_qty >= entry_qty - 1e-9:
+                queue.pop(0)
+            else:
+                entry["qty"] -= match_qty
+
+    # Remaining open positions → outcome=pending, pnl_pct=0
+    for sym, queue in open_positions.items():
+        for entry in queue:
+            records.append({
+                "run_id": run_id,
+                "decision_id": f"{run_id}_open_{entry['entry_time'].isoformat()}_{sym}",
+                "decision_sim_time": entry["entry_time"],
+                "symbol": sym,
+                "action": "buy",
+                "side": "buy",
+                "filled_quantity": entry["qty"],
+                "entry_price": entry["entry_price"],
+                "exit_price": 0.0,
+                "entry_time": entry["entry_time"],
+                "exit_time": None,
+                "pnl_pct": 0.0,
+                "outcome": "pending",
+                "regime": regime,
+                "indicators_snapshot": "{}",
+            })
+
+    return records
+
+
+def _build_decision_record_for_memory(
+    rt: dict[str, Any],
+    strategy_name: str,
+) -> dict[str, Any]:
+    """Convert a round-trip record into a NexusDecisionRecord dict ready for embedding.
+
+    The DNA string is the same format as the live ``NexusVectorMemory``
+    store, so semantic search will surface backtest-replay decisions
+    alongside live decisions when the recall query doesn't filter by
+    backtest_id.
+    """
+    ts = rt.get("decision_sim_time")
+    if hasattr(ts, "isoformat"):
+        ts_iso = ts.isoformat(timespec="seconds")
+    else:
+        ts_iso = str(ts or "")
+
+    symbol = rt.get("symbol", "")
+    action = rt.get("action", "hold")
+    regime = rt.get("regime", "backtest")
+    outcome = rt.get("outcome", "pending")
+    pnl_pct = float(rt.get("pnl_pct", 0.0))
+    decision_id = rt.get("decision_id", "")
+
+    thesis = (
+        f"Backtest replay: {action.upper()} {symbol} @ {rt.get('entry_price', 0):.2f}, "
+        f"exit @ {rt.get('exit_price', 0):.2f}, "
+        f"{rt.get('filled_quantity', 0):.4f} units, "
+        f"round-trip from {rt.get('entry_time')} to {rt.get('exit_time')}"
+    )
+    indicators = rt.get("indicators_snapshot") or "{}"
+
+    return {
+        "id": decision_id,
+        "symbol": symbol,
+        "action": action,
+        "regime": regime,
+        "thesis_summary": thesis[:500],
+        "indicators_snapshot": indicators,
+        "outcome": outcome,
+        "pnl_pct": pnl_pct,
+        "timestamp": ts_iso,
+        # A3: stamp decision_sim_time so the recall pre-filter
+        # (``decision_sim_time <= as_of_sim_time``) works during future
+        # backtest replays.
+        "decision_sim_time": ts_iso,
+        "strategy_name": strategy_name,
+        "backtest_id": rt.get("run_id", ""),
+    }
+
+
+def _replay_trades_to_lancedb(
+    round_trips: list[dict[str, Any]],
+    strategy_name: str,
+) -> dict[str, int]:
+    """Push round-trip records into nexus_decisions.lance via subprocess.
+
+    The Lumibot venv doesn't have lancedb or sentence-transformers, so we
+    spawn a subprocess in the AQOS venv to do the embedding + insert. This
+    is the same pattern as ``src.memory.bridge.invoke_aqos_tool()``.
+
+    Subprocess command:
+
+        /home/Zev/development/agentic-quant-os/.venv/bin/python -m src.runners._replay_subprocess_runner
+            --round-trips-json <tmp.json>
+            --strategy-name <name>
+
+    The runner imports ``NexusVectorMemory`` and calls
+    ``batch_store_decisions``. It writes a JSON summary to stdout that we
+    parse here.
+
+    Returns
+    -------
+    dict
+        Stats from the subprocess: {embedded, skipped, errors, total}.
+        On subprocess failure: {errors: N, error_detail: str}.
+    """
+    if not round_trips:
+        return {"embedded": 0, "skipped": 0, "errors": 0, "total": 0}
+
+    if not os.path.exists(_AQOS_VENV_PY):
+        logger.warning(
+            "AQOS venv not found at %s — skipping memory replay", _AQOS_VENV_PY,
+        )
+        return {
+            "embedded": 0, "skipped": 0,
+            "errors": len(round_trips),
+            "total": len(round_trips),
+            "error_detail": f"AQOS venv missing at {_AQOS_VENV_PY}",
+        }
+
+    # Build the decision records (no embeddings yet — the subprocess does that)
+    decision_records = [
+        _build_decision_record_for_memory(rt, strategy_name)
+        for rt in round_trips
+    ]
+
+    # Serialize to a temp JSON file in the project logs dir
+    import tempfile, json
+    tmp_dir = _PROJECT_ROOT / "logs"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json",
+        prefix=f"replay_{strategy_name}_",
+        dir=str(tmp_dir), delete=False,
+    ) as tmp:
+        json.dump(decision_records, tmp, default=str)
+        tmp_path = tmp.name
+
+    try:
+        cmd = [
+            _AQOS_VENV_PY, "-m", "src.runners._replay_subprocess_runner",
+            "--round-trips-json", tmp_path,
+            "--strategy-name", strategy_name,
+        ]
+        logger.info(
+            "Replaying %d backtest decisions via subprocess: %s",
+            len(decision_records), " ".join(cmd),
+        )
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=300,  # 5 min — embedding 100s of decisions on CPU is slow
+            cwd=str(_PROJECT_ROOT),
+            env={**os.environ, "PYTHONPATH": _AQOS_PYTHONPATH},
+        )
+        if result.returncode != 0:
+            logger.error(
+                "Replay subprocess failed (rc=%d): %s",
+                result.returncode, result.stderr[-2000:],
+            )
+            return {
+                "embedded": 0, "skipped": 0,
+                "errors": len(decision_records),
+                "total": len(decision_records),
+                "error_detail": f"subprocess rc={result.returncode}: {result.stderr[-500:]}",
+            }
+        # Parse last JSON line from stdout
+        stdout = result.stdout.strip()
+        for line in reversed(stdout.splitlines()):
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+        return {
+            "embedded": 0, "skipped": 0,
+            "errors": len(decision_records),
+            "total": len(decision_records),
+            "error_detail": f"could not parse subprocess stdout: {stdout[-200:]}",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "embedded": 0, "skipped": 0,
+            "errors": len(decision_records),
+            "total": len(decision_records),
+            "error_detail": "subprocess timeout (300s)",
+        }
+    except Exception as exc:
+        logger.exception("Replay subprocess launch failed")
+        return {
+            "embedded": 0, "skipped": 0,
+            "errors": len(decision_records),
+            "total": len(decision_records),
+            "error_detail": str(exc),
+        }
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def _sync_trades(con, logs_dir: Path, run_id: str) -> int:
-    """Read trades.parquet → insert into backtest_trades. Returns rows inserted."""
+    """Read trades.parquet → insert into backtest_trades. Returns rows inserted.
+
+    Populates the A3 fields (``decision_sim_time``, ``outcome``, ``pnl_pct``,
+    ``round_trip_id``) from the FIFO round-trip projection so each fill is
+    tagged with its outcome (win/loss/pending) and the entry-bar time the
+    trade was decided at.
+    """
     trades_path = _find_artifact(logs_dir, run_id, "trades")
     if trades_path is None:
         logger.warning("No trades artifact for run %s", run_id)
@@ -292,18 +731,52 @@ def _sync_trades(con, logs_dir: Path, run_id: str) -> int:
         logger.info("No trades in run %s (0 trades)", run_id)
         return 0
 
+    # Project to round-trips so we can stamp outcome / pnl_pct / decision_sim_time
+    round_trips = _project_trades_to_round_trips(df, run_id)
+    rt_by_decision_time: dict[tuple[str, object], dict[str, Any]] = {}
+    for rt in round_trips:
+        key = (str(rt.get("symbol", "")), rt.get("entry_time") or rt.get("decision_sim_time"))
+        rt_by_decision_time[key] = rt
+
     rows = []
     for _, row in df.iterrows():
+        event_ts = (
+            pd.to_datetime(row.get("time")).to_pydatetime()
+            if pd.notna(row.get("time")) else None
+        )
+        sym = str(row.get("symbol", ""))
+        # Look up matching round-trip to fill outcome / decision_sim_time
+        rt = rt_by_decision_time.get((sym, event_ts))
+        decision_sim_time = (
+            rt.get("decision_sim_time") if rt else event_ts
+        )
+        outcome = rt.get("outcome") if rt else "pending"
+        pnl_pct = rt.get("pnl_pct") if rt else 0.0
+        round_trip_id = (
+            rt.get("decision_id") if rt else None
+        )
+        # Normalize decision_sim_time to a Python datetime (or None)
+        if decision_sim_time is None:
+            ds_dt: Any = None
+        else:
+            try:
+                ds_dt = pd.to_datetime(decision_sim_time).to_pydatetime()
+            except Exception:
+                ds_dt = None
         rows.append([
             run_id,
-            pd.to_datetime(row.get("time")).to_pydatetime() if pd.notna(row.get("time")) else None,
-            str(row.get("symbol", "")),
+            event_ts,
+            sym,
             str(row.get("side", "")),
             _safe_float(row.get("filled_quantity")),
             _safe_float(row.get("price")),
             _safe_float(row.get("trade_cost")),
             str(row.get("asset.asset_type", "")),
             str(row.get("event_kind", "")),
+            ds_dt,
+            outcome,
+            float(pnl_pct) if pnl_pct is not None else 0.0,
+            round_trip_id or "",
         ])
 
     # Delete existing rows for this run_id (idempotent)
@@ -312,13 +785,75 @@ def _sync_trades(con, logs_dir: Path, run_id: str) -> int:
         """
         INSERT INTO backtest_trades
         (run_id, event_timestamp, symbol, side, filled_quantity,
-         price, trade_cost, asset_type, event_kind)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         price, trade_cost, asset_type, event_kind,
+         decision_sim_time, outcome, pnl_pct, round_trip_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
     logger.info("Inserted %d trades for run %s", len(rows), run_id)
     return len(rows)
+
+
+def _sync_trades_to_memory(
+    logs_dir: Path, run_id: str, strategy_name: str,
+) -> dict[str, Any]:
+    """A3: project trades → round-trips → push to nexus_decisions.lance.
+
+    Reads the same trades.parquet artifact and projects it through
+    ``_project_trades_to_round_trips``, then invokes the AQOS-venv
+    subprocess bridge to embed + store each round-trip as a
+    NexusDecisionRecord.
+
+    Returns
+    -------
+    dict
+        Stats: ``{round_trips, embedded, skipped, errors, replay_enabled}``.
+        ``replay_enabled=False`` if NEXUS_BACKTEST_REPLAY is set to "0"
+        (escape hatch for environments where the AQOS venv isn't reachable).
+    """
+    if not _REPLAY_FLAG:
+        return {
+            "round_trips": 0, "embedded": 0, "skipped": 0,
+            "errors": 0, "replay_enabled": False,
+        }
+
+    trades_path = _find_artifact(logs_dir, run_id, "trades")
+    if trades_path is None:
+        return {
+            "round_trips": 0, "embedded": 0, "skipped": 0,
+            "errors": 0, "replay_enabled": True,
+            "note": "no trades artifact",
+        }
+
+    import pandas as pd
+    try:
+        df = pd.read_parquet(trades_path)
+    except Exception as exc:
+        logger.warning("Failed to read trades parquet for replay (%s): %s", trades_path, exc)
+        return {
+            "round_trips": 0, "embedded": 0, "skipped": 0,
+            "errors": 1, "replay_enabled": True,
+            "error_detail": str(exc),
+        }
+
+    round_trips = _project_trades_to_round_trips(df, run_id)
+    if not round_trips:
+        return {
+            "round_trips": 0, "embedded": 0, "skipped": 0,
+            "errors": 0, "replay_enabled": True,
+            "note": "no round-trips to replay (empty trades.parquet)",
+        }
+
+    stats = _replay_trades_to_lancedb(round_trips, strategy_name)
+    return {
+        "round_trips": len(round_trips),
+        "embedded": stats.get("embedded", 0),
+        "skipped": stats.get("skipped", 0),
+        "errors": stats.get("errors", 0),
+        "replay_enabled": True,
+        "error_detail": stats.get("error_detail"),
+    }
 
 
 def _sync_agent_detail(con, logs_dir: Path, run_id: str) -> int:
@@ -436,6 +971,7 @@ def sync_backtest_results(
     con = duckdb.connect(str(_db))
     errors: list[str] = []
     runs = trades = observations = 0
+    strategy_name = _strategy_from_run_id(run_id)
 
     try:
         runs = _sync_stats(con, _logs, run_id)
@@ -457,11 +993,28 @@ def sync_backtest_results(
 
     con.close()
 
+    # A3 (2026-06-25): backtest replay → nexus_decisions.lance.
+    # Done after the DuckDB sync so the trades table is the authoritative
+    # source for the FIFO round-trip projection. Wrapped in try/except
+    # because a subprocess bridge failure must not block the rest of the
+    # sync summary.
+    memory_replay: dict[str, Any] = {
+        "round_trips": 0, "embedded": 0, "skipped": 0,
+        "errors": 0, "replay_enabled": _REPLAY_FLAG,
+    }
+    try:
+        memory_replay = _sync_trades_to_memory(_logs, run_id, strategy_name)
+    except Exception as exc:
+        errors.append(f"memory_replay: {exc}")
+        logger.exception("Failed to replay trades to memory for %s", run_id)
+
     summary = {
         "run_id": run_id,
+        "strategy_name": strategy_name,
         "runs_inserted": runs,
         "trades_inserted": trades,
         "observations_inserted": observations,
+        "memory_replay": memory_replay,
         "errors": errors,
     }
     logger.info("Sync complete: %s", summary)
