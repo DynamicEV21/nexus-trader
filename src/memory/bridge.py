@@ -184,6 +184,111 @@ class MemoryBridge:
         return result
 
     # ------------------------------------------------------------------
+    # B1 attribution: outcome / lesson updates
+    # ------------------------------------------------------------------
+    #
+    # These two methods are called from the lumibot venv via the
+    # ``src/runners/attribution_bridge.py`` subprocess wrapper. They live
+    # here (in the AQOS-venv-bridged code) because the LanceDB /
+    # sentence-transformers stack is not installed in the lumibot venv.
+    #
+    # Both methods are best-effort: any exception inside returns
+    # ``{"ok": False, "error": str(exc)}`` and is logged at WARNING. The
+    # calling subprocess wrapper converts non-ok results to DEBUG.
+    # ------------------------------------------------------------------
+
+    def update_outcome(
+        self,
+        decision_id: str,
+        outcome: str,
+        pnl_pct: float,
+        symbol: str = "",
+    ) -> dict[str, Any]:
+        """Update the outcome field of an existing LanceDB decision row.
+
+        Looks up the decision by ``decision_id`` (the unique key that
+        ``remember_decision_tool`` writes with). Re-embeds nothing — just
+        patches the ``outcome`` and ``pnl_pct`` columns in place.
+
+        Args:
+            decision_id: The decision's stable ID (e.g. ``decision_2026-06-25T15:00_BTC``).
+            outcome: ``"win"``, ``"loss"``, or ``"breakeven"``.
+            pnl_pct: Realized percent PnL (signed; 3.5 means +3.5%).
+            symbol: Ticker symbol (for logging only).
+
+        Returns:
+            dict with ``ok`` (bool) and ``decision_id`` (str). On error,
+            ``ok=False`` and ``error`` carries the message.
+        """
+        try:
+            nexus = self.nexus_memory
+            if not getattr(nexus, "enabled", False):
+                return {"ok": False, "decision_id": decision_id,
+                        "error": "vector memory disabled"}
+            ok = nexus.update_decision_outcome(
+                decision_id=decision_id,
+                outcome=outcome,
+                pnl_pct=float(pnl_pct),
+            )
+            return {"ok": bool(ok), "decision_id": decision_id,
+                    "outcome": outcome, "pnl_pct": float(pnl_pct),
+                    "symbol": symbol}
+        except Exception as exc:
+            logger.warning(
+                "update_outcome(%s) failed: %s", decision_id, exc,
+            )
+            return {"ok": False, "decision_id": decision_id, "error": str(exc)}
+
+    def write_lesson(
+        self,
+        text: str,
+        category: str = "insight",
+        severity: str = "info",
+        symbol: str = "",
+        regime: str = "",
+        tags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Write a lesson into LanceDB ``lessons`` table.
+
+        Used by ``PaperTradeCommitteeStrategy._attribution_write_loss_lesson``
+        for auto-loss lessons. The function builds a deterministic lesson
+        id from a hash of (text + timestamp-floor-to-minute) so that
+        repeated calls in the same minute don't create duplicates.
+
+        Args:
+            text: Lesson body.
+            category: ``"mistake"``, ``"insight"``, ``"pattern"``, ``"adaptation"``.
+            severity: ``"info"``, ``"warning"``, ``"critical"``.
+            symbol: Related ticker.
+            regime: Related market regime.
+            tags: Optional tag list.
+
+        Returns:
+            dict with ``ok`` (bool) and ``lesson_id`` (str).
+        """
+        try:
+            nexus = self.nexus_memory
+            if not getattr(nexus, "enabled", False):
+                return {"ok": False, "error": "vector memory disabled"}
+            tags_list = list(tags or [])
+            stored = nexus.store_lesson({
+                "id": "",  # let the vector memory assign one
+                "text": text,
+                "category": category,
+                "severity": severity,
+                "symbol": symbol,
+                "regime": regime,
+                "tags": tags_list,
+                "strategy_name": self.strategy_name,
+                "source": "attribution_bridge",
+            })
+            return {"ok": bool(stored), "text": text[:200],
+                    "category": category, "severity": severity}
+        except Exception as exc:
+            logger.warning("write_lesson() failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
     # Sync methods
     # ------------------------------------------------------------------
 

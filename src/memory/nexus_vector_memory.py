@@ -99,6 +99,46 @@ class NexusLessonRecord(LanceModel):
     source: str = Field(description="Origin: committee, backtest, manual, bridge")
 
 
+class NexusWalkforwardRecord(LanceModel):
+    """LanceDB row schema for a walk-forward OOS window result.
+
+    Stores per-window OOS evidence for a (strategy_name, symbol, regime)
+    combination — sourced from ``walk_forward_results`` in
+    ``nexus_results.duckdb``. Distinct from ``NexusDecisionRecord`` which
+    holds per-trade events: a walkforward record represents aggregate
+    out-of-sample performance for one OOS test window.
+
+    Lives in a **separate** LanceDB table (``nexus_walkforward``) so
+    backtest-replay decisions and live decisions don't pollute the
+    strategy-recall search space.
+    """
+
+    id: str = Field(description="Unique key: wf_{strategy}_{symbol}_{window_index}_{test_start}")
+    vector: Vector(EMBEDDING_DIM) = Field(description="Qwen3 embedding of strategy DNA + regime + window stats")  # type: ignore[valid-type]
+    text: str = Field(description="Walk-forward DNA string that was embedded")
+    strategy_name: str
+    symbol: str
+    regime: str = "unknown"  # derived from window's avg price action (future)
+    window_index: int
+    train_start: str = ""
+    train_end: str = ""
+    test_start: str = ""
+    test_end: str = ""
+    total_return_pct: float = 0.0
+    sharpe: float = 0.0
+    sortino: float = 0.0  # computed at seeding time from per-bar series (if available)
+    max_drawdown_pct: float = 0.0
+    profitable: bool = False
+    num_entries: int = 0
+    budget: float = 0.0
+    n_windows_total: int = 0  # number of WF windows for this (strategy, symbol) pair
+    n_profitable_windows: int = 0  # how many of those windows were profitable
+    avg_sortino_across_windows: float = 0.0
+    avg_sharpe_across_windows: float = 0.0
+    composite_rank_score: float = 0.0  # Sortino-weighted score for ranking
+    timestamp: str  # seed time (ISO8601)
+
+
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
@@ -134,11 +174,17 @@ class NexusVectorMemory:
         self._persist_dir = persist_dir or _DEFAULT_PERSIST_DIR
         self._decisions_table_name = "nexus_decisions"
         self._lessons_table_name = "nexus_lessons"
+        # Walk-forward OOS windows live in a SEPARATE table from decisions.
+        # They represent aggregate per-window OOS performance, not per-trade
+        # events. Keeping them apart prevents the strategy-recall search from
+        # returning 1 hit per OOS window when looking for live decisions.
+        self._walkforward_table_name = "nexus_walkforward"
 
         # Lazy-initialized
         self._db = None
         self._decisions_table = None
         self._lessons_table = None
+        self._walkforward_table = None
         self._model_name = model_name or EMBEDDING_MODEL
         self._model: Any | None = None
 
@@ -187,11 +233,22 @@ class NexusVectorMemory:
                 )
                 logger.info("Created new table: %s", self._lessons_table_name)
 
+            if self._walkforward_table_name in existing_tables:
+                self._walkforward_table = self._db.open_table(self._walkforward_table_name)
+            else:
+                self._walkforward_table = self._db.create_table(
+                    self._walkforward_table_name,
+                    schema=NexusWalkforwardRecord,
+                    exist_ok=True,
+                )
+                logger.info("Created new table: %s", self._walkforward_table_name)
+
             logger.debug(
-                "Nexus LanceDB ready at %s (decisions=%d, lessons=%d)",
+                "Nexus LanceDB ready at %s (decisions=%d, lessons=%d, walkforward=%d)",
                 self._persist_dir,
                 self._decisions_table.count_rows() if self._decisions_table else 0,
                 self._lessons_table.count_rows() if self._lessons_table else 0,
+                self._walkforward_table.count_rows() if self._walkforward_table else 0,
             )
         except Exception:
             logger.exception(
@@ -509,6 +566,121 @@ class NexusVectorMemory:
 
         return stats
 
+    # ------------------------------------------------------------------
+    # B1 attribution (2026-06-25) — update an existing decision's outcome
+    # ------------------------------------------------------------------
+    #
+    # Called from ``MemoryBridge.update_outcome()`` (src/memory/bridge.py)
+    # which is itself invoked from the lumibot venv via subprocess wrapper
+    # ``src/runners/attribution_bridge.py``. The path is:
+    #
+    #   PaperTradeCommitteeStrategy.on_filled_order() detects a CLOSE
+    #     → _attribution_bridge_call(decision_id, outcome, pnl_pct, symbol)
+    #       → subprocess (_AQOS_PYTHON)
+    #         → MemoryBridge.update_outcome(...)
+    #           → NexusVectorMemory.update_decision_outcome(...)
+    #
+    # We do NOT re-embed (the vector doesn't change — the decision's
+    # meaning didn't change, only its outcome did). We patch the row in
+    # place using ``LanceDB.delete() + .add()`` because LanceDB's
+    # ``update()`` API varies by version.
+    # ------------------------------------------------------------------
+
+    def update_decision_outcome(
+        self,
+        decision_id: str,
+        outcome: str,
+        pnl_pct: float,
+    ) -> bool:
+        """Patch outcome + pnl_pct on an existing decision row.
+
+        Args:
+            decision_id: The decision's stable ID (must already exist
+                in ``nexus_decisions`` — this method does NOT create a
+                new row if the ID is unknown).
+            outcome: ``"win"``, ``"loss"``, ``"breakeven"``, or
+                ``"pending"`` to clear.
+            pnl_pct: Realized percent PnL (signed).
+
+        Returns:
+            ``True`` if the row was updated (or found and patched),
+            ``False`` if disabled, missing, or errored.
+        """
+        if not self.enabled:
+            return False
+        if not decision_id:
+            logger.warning("update_decision_outcome: empty decision_id")
+            return False
+
+        try:
+            self._ensure_db()
+            if not self.enabled or self._decisions_table is None:
+                return False
+
+            safe_id = decision_id.replace("'", "''")
+
+            # Pull the existing row (need its vector + text for delete+add).
+            # We use ``to_pandas`` filter — cheap because LanceDB tables
+            # are columnar and we only need one row.
+            try:
+                existing_df = (
+                    self._decisions_table.to_pandas()
+                    if hasattr(self._decisions_table, "to_pandas")
+                    else None
+                )
+            except Exception:
+                existing_df = None
+
+            if existing_df is None or existing_df.empty:
+                logger.warning(
+                    "update_decision_outcome: decision %s not found in LanceDB",
+                    decision_id,
+                )
+                return False
+
+            matches = existing_df[existing_df["id"] == decision_id]
+            if matches.empty:
+                logger.warning(
+                    "update_decision_outcome: decision %s not found in LanceDB",
+                    decision_id,
+                )
+                return False
+
+            row = matches.iloc[0].to_dict()
+
+            # Delete the old row, then add the patched one. Vector and
+            # text are unchanged; only outcome + pnl_pct change.
+            try:
+                self._decisions_table.delete(f"id = '{safe_id}'")
+            except Exception as exc:
+                logger.debug("update_decision_outcome: delete failed (continuing): %s", exc)
+
+            row["outcome"] = outcome
+            row["pnl_pct"] = float(pnl_pct)
+
+            try:
+                self._decisions_table.add([row])
+            except Exception:
+                # Some LanceDB versions disallow re-adding same id; in
+                # that case the ``delete`` already happened so the table
+                # is in a stale-but-correct state. Log loudly.
+                logger.exception(
+                    "update_decision_outcome: re-add failed for %s", decision_id,
+                )
+                return False
+
+            logger.info(
+                "Updated decision outcome: %s -> %s (pnl=%.2f%%)",
+                decision_id, outcome, pnl_pct,
+            )
+            return True
+
+        except Exception:
+            logger.exception(
+                "update_decision_outcome(%s) failed", decision_id,
+            )
+            return False
+
     def search_similar_decisions(
         self,
         query_text: str,
@@ -819,6 +991,437 @@ class NexusVectorMemory:
         return "\n".join(parts) if parts else ""
 
     # ------------------------------------------------------------------
+    # Public API — Walk-Forward OOS windows
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_walkforward_dna(record: dict[str, Any]) -> str:
+        """Construct a human-readable DNA string for embedding a walk-forward window.
+
+        Format::
+
+            [STRATEGY] [SYMBOL] OOS window {window_index} in {regime} regime |
+            Window: test_start -> test_end |
+            Return: +X.XX% | Sharpe: X.XX | Sortino: X.XX | MaxDD: -X.XX% |
+            Profitable: yes/no (N_profitable/N_total windows for this strategy+symbol)
+        """
+        strategy = record.get("strategy_name", "unknown")
+        symbol = record.get("symbol", "???")
+        regime = record.get("regime", "unknown")
+        window_index = record.get("window_index", 0)
+        test_start = record.get("test_start", "")
+        test_end = record.get("test_end", "")
+        total_return = float(record.get("total_return_pct", 0.0))
+        sharpe = float(record.get("sharpe", 0.0))
+        sortino = float(record.get("sortino", 0.0))
+        max_dd = float(record.get("max_drawdown_pct", 0.0))
+        n_total = int(record.get("n_windows_total", 0))
+        n_prof = int(record.get("n_profitable_windows", 0))
+        profitable = bool(record.get("profitable", False))
+
+        return (
+            f"[{strategy}] [{symbol}] OOS window {window_index} in {regime} regime | "
+            f"Window: {test_start} -> {test_end} | "
+            f"Return: {total_return:+.2f}% | "
+            f"Sharpe: {sharpe:.2f} | Sortino: {sortino:.2f} | "
+            f"MaxDD: {max_dd:.2f}% | "
+            f"Profitable: {'yes' if profitable else 'no'} "
+            f"({n_prof}/{n_total} profitable windows for this strategy+symbol)"
+        )
+
+    def store_walkforward_record(self, record: dict[str, Any]) -> bool:
+        """Store a single walk-forward OOS window result.
+
+        Parameters
+        ----------
+        record : dict
+            Must have keys: ``id``, ``strategy_name``, ``symbol``, ``window_index``.
+            Optional: ``regime``, ``train_start/end``, ``test_start/end``,
+            ``total_return_pct``, ``sharpe``, ``sortino``,
+            ``max_drawdown_pct``, ``profitable``, ``num_entries``, ``budget``,
+            ``n_windows_total``, ``n_profitable_windows``,
+            ``avg_sortino_across_windows``, ``avg_sharpe_across_windows``,
+            ``composite_rank_score``, ``timestamp``.
+
+        Returns
+        -------
+        bool
+            ``True`` if persisted successfully.
+        """
+        if not self.enabled:
+            return False
+
+        try:
+            self._ensure_db()
+            if not self.enabled or self._walkforward_table is None:
+                return False
+
+            dna = self._build_walkforward_dna(record)
+            vector = self._get_embedding(dna)
+            if not vector:
+                logger.warning(
+                    "Skipping walkforward %s — no embedding produced",
+                    record.get("id", "?"),
+                )
+                return False
+
+            wf = NexusWalkforwardRecord(
+                id=record.get("id"),
+                vector=vector,
+                text=dna,
+                strategy_name=record.get("strategy_name", ""),
+                symbol=record.get("symbol", ""),
+                regime=record.get("regime", "unknown"),
+                window_index=int(record.get("window_index", 0)),
+                train_start=str(record.get("train_start", "")),
+                train_end=str(record.get("train_end", "")),
+                test_start=str(record.get("test_start", "")),
+                test_end=str(record.get("test_end", "")),
+                total_return_pct=float(record.get("total_return_pct", 0.0)),
+                sharpe=float(record.get("sharpe", 0.0)),
+                sortino=float(record.get("sortino", 0.0)),
+                max_drawdown_pct=float(record.get("max_drawdown_pct", 0.0)),
+                profitable=bool(record.get("profitable", False)),
+                num_entries=int(record.get("num_entries", 0)),
+                budget=float(record.get("budget", 0.0)),
+                n_windows_total=int(record.get("n_windows_total", 0)),
+                n_profitable_windows=int(record.get("n_profitable_windows", 0)),
+                avg_sortino_across_windows=float(
+                    record.get("avg_sortino_across_windows", 0.0)
+                ),
+                avg_sharpe_across_windows=float(
+                    record.get("avg_sharpe_across_windows", 0.0)
+                ),
+                composite_rank_score=float(record.get("composite_rank_score", 0.0)),
+                timestamp=str(record.get("timestamp", "")),
+            )
+
+            # Upsert by id
+            try:
+                safe_id = wf.id.replace("'", "''")
+                self._walkforward_table.delete(f"id = '{safe_id}'")
+            except Exception:
+                pass
+
+            self._walkforward_table.add([wf.model_dump()])
+            logger.info(
+                "Stored walkforward %s (%s %s window %d, sortino=%.2f)",
+                wf.id, wf.strategy_name, wf.symbol, wf.window_index, wf.sortino,
+            )
+            return True
+
+        except Exception:
+            logger.exception(
+                "Failed to store walkforward %s", record.get("id", "?")
+            )
+            return False
+
+    def batch_store_walkforward_records(
+        self,
+        records: list[dict[str, Any]],
+        batch_size: int = 100,
+    ) -> dict[str, int]:
+        """Embed and store multiple walk-forward records in batches.
+
+        Parameters
+        ----------
+        records : list[dict]
+            Each dict must have: ``id``, ``strategy_name``, ``symbol``,
+            ``window_index``.
+        batch_size : int
+            Number of records per batch for embedding.
+
+        Returns
+        -------
+        dict[str, int]
+            Keys: ``embedded``, ``skipped``, ``errors``, ``total``.
+        """
+        stats: dict[str, int] = {"embedded": 0, "skipped": 0, "errors": 0, "total": len(records)}
+
+        if not self.enabled or not records:
+            return stats
+
+        try:
+            self._ensure_db()
+            if not self.enabled or self._walkforward_table is None:
+                stats["errors"] = len(records)
+                return stats
+        except Exception:
+            logger.exception("Failed to ensure DB for batch walkforward store")
+            stats["errors"] = len(records)
+            return stats
+
+        # Pre-load existing IDs to skip duplicates (upsert-aware).
+        existing_ids: set[str] = set()
+        try:
+            rows = (
+                self._walkforward_table.search().select(["id"]).limit(500_000).to_list()
+            )
+            existing_ids = {r["id"] for r in rows}
+        except Exception:
+            logger.warning("Could not pre-load existing walkforward IDs; will try upserts")
+
+        for batch_start in range(0, len(records), batch_size):
+            batch = records[batch_start : batch_start + batch_size]
+
+            dna_strings: list[str] = []
+            record_ids: list[str] = []
+            valid_indices: list[int] = []
+
+            for i, rec in enumerate(batch):
+                rid = rec.get("id", "")
+                if not rid:
+                    rid = (
+                        f"wf_{rec.get('strategy_name', 'unk')}_{rec.get('symbol', 'unk')}_"
+                        f"{rec.get('window_index', 0)}_{rec.get('test_start', 'unknown')}"
+                    )
+                    rec["id"] = rid
+                if rid in existing_ids:
+                    stats["skipped"] += 1
+                    continue
+                dna = self._build_walkforward_dna(rec)
+                dna_strings.append(dna)
+                record_ids.append(rid)
+                valid_indices.append(i)
+
+            if not dna_strings:
+                continue
+
+            try:
+                vectors = self._batch_embed(dna_strings)
+            except Exception:
+                logger.exception("Batch embed failed for walkforward at offset %d", batch_start)
+                vectors = [[] for _ in dna_strings]
+
+            records_to_add: list[dict[str, Any]] = []
+            for j, idx in enumerate(valid_indices):
+                rec = batch[idx]
+                if j < len(vectors) and vectors[j]:
+                    try:
+                        wf = NexusWalkforwardRecord(
+                            id=record_ids[j],
+                            vector=vectors[j],
+                            text=dna_strings[j],
+                            strategy_name=rec.get("strategy_name", ""),
+                            symbol=rec.get("symbol", ""),
+                            regime=rec.get("regime", "unknown"),
+                            window_index=int(rec.get("window_index", 0)),
+                            train_start=str(rec.get("train_start", "")),
+                            train_end=str(rec.get("train_end", "")),
+                            test_start=str(rec.get("test_start", "")),
+                            test_end=str(rec.get("test_end", "")),
+                            total_return_pct=float(rec.get("total_return_pct", 0.0)),
+                            sharpe=float(rec.get("sharpe", 0.0)),
+                            sortino=float(rec.get("sortino", 0.0)),
+                            max_drawdown_pct=float(rec.get("max_drawdown_pct", 0.0)),
+                            profitable=bool(rec.get("profitable", False)),
+                            num_entries=int(rec.get("num_entries", 0)),
+                            budget=float(rec.get("budget", 0.0)),
+                            n_windows_total=int(rec.get("n_windows_total", 0)),
+                            n_profitable_windows=int(rec.get("n_profitable_windows", 0)),
+                            avg_sortino_across_windows=float(
+                                rec.get("avg_sortino_across_windows", 0.0)
+                            ),
+                            avg_sharpe_across_windows=float(
+                                rec.get("avg_sharpe_across_windows", 0.0)
+                            ),
+                            composite_rank_score=float(rec.get("composite_rank_score", 0.0)),
+                            timestamp=str(rec.get("timestamp", "")),
+                        )
+                        records_to_add.append(wf.model_dump())
+                        existing_ids.add(record_ids[j])
+                        stats["embedded"] += 1
+                    except Exception:
+                        logger.exception(
+                            "Failed to build walkforward record for %s", record_ids[j]
+                        )
+                        stats["errors"] += 1
+                else:
+                    stats["errors"] += 1
+
+            if records_to_add:
+                try:
+                    self._walkforward_table.add(records_to_add)
+                except Exception:
+                    logger.exception(
+                        "Failed to insert walkforward batch at offset %d", batch_start
+                    )
+                    stats["errors"] += len(records_to_add)
+                    stats["embedded"] -= len(records_to_add)
+
+            done = batch_start + len(batch)
+            if done % (batch_size * 5) == 0 or done >= len(records):
+                logger.info(
+                    "Walkforward batch progress: %d/%d embedded=%d skipped=%d errors=%d",
+                    done, len(records),
+                    stats["embedded"], stats["skipped"], stats["errors"],
+                )
+
+        return stats
+
+    def search_walkforward(
+        self,
+        query_text: str,
+        n_results: int = 5,
+        symbol: str | None = None,
+        regime: str | None = None,
+        min_sortino: float = 0.0,
+        only_profitable: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Search the walk-forward memory for OOS evidence.
+
+        Parameters
+        ----------
+        query_text : str
+            Natural-language query describing the strategy / regime / symbol
+            combination being evaluated.
+        n_results : int
+            Maximum number of results.
+        symbol : str | None
+            Optional filter by symbol.
+        regime : str | None
+            Optional filter by regime.
+        min_sortino : float
+            Optional filter: minimum Sortino ratio (0 = no filter).
+        only_profitable : bool
+            If True, only return windows with ``profitable = True``.
+
+        Returns
+        -------
+        list[dict]
+            Each dict has keys ``text``, ``metadata``, ``distance``.
+        """
+        if not self.enabled or not query_text or not query_text.strip():
+            return []
+
+        try:
+            self._ensure_db()
+            if not self.enabled or self._walkforward_table is None:
+                return []
+
+            query_vector = self._get_embedding(query_text)
+            if not query_vector:
+                return []
+
+            # Over-fetch when filtering, so we can post-filter to n_results.
+            fetch_n = n_results * 4 if (
+                symbol or regime or min_sortino > 0 or only_profitable
+            ) else n_results
+
+            query = self._walkforward_table.search(query_vector).limit(fetch_n)
+
+            clauses: list[str] = []
+            if symbol:
+                clauses.append(f"symbol = '{symbol.replace(chr(39), chr(39)+chr(39))}'")
+            if regime:
+                clauses.append(f"regime = '{regime.replace(chr(39), chr(39)+chr(39))}'")
+            if min_sortino > 0:
+                clauses.append(f"sortino >= {float(min_sortino)}")
+            if only_profitable:
+                clauses.append("profitable = true")
+            if clauses:
+                query = query.where(" AND ".join(clauses), prefilter=True)
+
+            rows = query.to_list()
+
+            # Re-rank by composite_rank_score (Sortino-weighted) so the
+            # PM sees the most-relevant OOS evidence at the top.
+            def _rank_key(row: dict[str, Any]) -> float:
+                return float(row.get("composite_rank_score", 0.0))
+
+            rows.sort(key=_rank_key, reverse=True)
+
+            results: list[dict[str, Any]] = []
+            for row in rows[:n_results]:
+                distance = row.pop("_distance", None)
+                row.pop("vector", None)
+                text = row.pop("text", "")
+                metadata = dict(row)
+                results.append({"text": text, "metadata": metadata, "distance": distance})
+            return results
+
+        except Exception:
+            logger.exception("Walkforward search failed: %s", query_text[:100])
+            return []
+
+    def get_walkforward_stats(self) -> dict[str, Any]:
+        """Aggregate stats across the entire ``nexus_walkforward`` table.
+
+        Returns
+        -------
+        dict
+            Keys: ``total_windows``, ``unique_strategies``, ``unique_symbols``,
+            ``n_profitable``, ``avg_sortino``, ``avg_sharpe``,
+            ``top_strategies_by_sortino`` (list of strategy_name+symbol pairs).
+        """
+        stats: dict[str, Any] = {
+            "total_windows": 0,
+            "unique_strategies": 0,
+            "unique_symbols": 0,
+            "n_profitable": 0,
+            "avg_sortino": 0.0,
+            "avg_sharpe": 0.0,
+            "top_strategies_by_sortino": [],
+        }
+
+        if not self.enabled:
+            return stats
+
+        try:
+            self._ensure_db()
+            if not self.enabled or self._walkforward_table is None:
+                return stats
+
+            rows = (
+                self._walkforward_table.search()
+                .select([
+                    "strategy_name", "symbol", "sortino", "sharpe",
+                    "profitable", "composite_rank_score",
+                ])
+                .limit(500_000)
+                .to_list()
+            )
+            if not rows:
+                return stats
+
+            stats["total_windows"] = len(rows)
+            stats["unique_strategies"] = len(
+                {r["strategy_name"] for r in rows if r.get("strategy_name")}
+            )
+            stats["unique_symbols"] = len(
+                {r["symbol"] for r in rows if r.get("symbol")}
+            )
+            stats["n_profitable"] = sum(1 for r in rows if r.get("profitable"))
+            sortinos = [float(r.get("sortino", 0.0)) for r in rows]
+            sharpes = [float(r.get("sharpe", 0.0)) for r in rows]
+            if sortinos:
+                stats["avg_sortino"] = sum(sortinos) / len(sortinos)
+            if sharpes:
+                stats["avg_sharpe"] = sum(sharpes) / len(sharpes)
+
+            # Top 10 (strategy, symbol) by avg Sortino across windows
+            by_pair: dict[tuple[str, str], list[float]] = {}
+            for r in rows:
+                key = (r.get("strategy_name", ""), r.get("symbol", ""))
+                by_pair.setdefault(key, []).append(float(r.get("sortino", 0.0)))
+            ranked = sorted(
+                (
+                    (k, sum(v) / len(v), len(v)) for k, v in by_pair.items()
+                ),
+                key=lambda x: x[1],
+                reverse=True,
+            )[:10]
+            stats["top_strategies_by_sortino"] = [
+                {"strategy_name": k[0], "symbol": k[1],
+                 "avg_sortino": round(avg_s, 3), "n_windows": n}
+                for k, avg_s, n in ranked
+            ]
+            return stats
+        except Exception:
+            logger.exception("Failed to compute walkforward stats")
+            return stats
+
+    # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
 
@@ -829,6 +1432,7 @@ class NexusVectorMemory:
             "persist_dir": self._persist_dir,
             "total_decisions": 0,
             "total_lessons": 0,
+            "total_walkforward_windows": 0,
         }
 
         if not self.enabled:
@@ -840,6 +1444,8 @@ class NexusVectorMemory:
                 stats["total_decisions"] = self._decisions_table.count_rows()
             if self._lessons_table is not None:
                 stats["total_lessons"] = self._lessons_table.count_rows()
+            if self._walkforward_table is not None:
+                stats["total_walkforward_windows"] = self._walkforward_table.count_rows()
         except Exception:
             logger.exception("Failed to read Nexus memory stats")
 

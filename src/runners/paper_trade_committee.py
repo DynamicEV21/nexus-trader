@@ -207,12 +207,30 @@ def make_committee_strategy_class():
             # History: 6→10 (Tristan 2026-06-23); 10→30 (full toolset
             # can run >10 LLM calls per agent; comfortable for 5 iterations).
             "agent_max_model_calls": 30,
+            # B1 attribution (2026-06-25): auto-write a lesson to LanceDB
+            # when a closed position lost more than 2% of position value.
+            "attribution_loss_threshold_pct": 2.0,
+            # Whether to invoke the subprocess bridge on every fill (heavy)
+            # or only on closes above the loss threshold (light). Default
+            # "light" — bridge is expensive (Qwen3-Embedding on full JSONL).
+            "attribution_bridge_mode": "light",
         }
         # Run immediately on startup rather than waiting an hour for the
         # first cron tick. Without this, the first committee run is delayed
         # by up to one hour after launch (because LumiBot's cron fires every
         # hour with cron_count_target=4 for 4H sleeptime).
         force_start_immediately = True
+
+        # ── B1 attribution state ───────────────────────────────────────
+        # Lumibot 4.5.53 has NO on_position_closed hook, so we synthesize
+        # one in on_filled_order by diffing pre- and post-fill quantities
+        # for each asset in our universe. ``_pre_fill_qty`` records the
+        # position state BEFORE the fill arrives; ``on_filled_order`` reads
+        # it to detect transitions (open / partial close / full close).
+        _pre_fill_qty: dict[str, float] = {}
+        _pending_outcomes: dict[str, dict] = {}  # symbol → open-trade record
+        _fills_processed: int = 0
+        _closes_processed: int = 0
 
         def initialize(self) -> None:
             """LumiBot lifecycle hook — runs once at strategy start.
@@ -280,6 +298,11 @@ def make_committee_strategy_class():
             Wraps the parent's full committee flow with Telegram
             start/end notifications so you get a push per bar.
             """
+            # B1 attribution: snapshot positions BEFORE the committee runs
+            # so the next on_filled_order has accurate pre-fill quantities
+            # even if the strategy fills an order during on_trading_iteration.
+            self._capture_pre_fill_state()
+
             run = (self.vars.committee_run_count or 0) + 1
             _send_notify(
                 self,
@@ -334,6 +357,423 @@ def make_committee_strategy_class():
                 severity="warning",
             )
             super().on_finish(*args, **kwargs)
+
+        # ──────────────────────────────────────────────────────────────
+        # B1 — Attribution loop (2026-06-25)
+        #
+        # Lumibot 4.5.53 has NO ``on_position_closed`` lifecycle hook
+        # (verified by grepping lumibot/strategies/strategy.py). The
+        # closest hook is ``on_filled_order``, which fires on every
+        # filled order — entry, exit, and partial. We synthesize position
+        # closes by diffing pre- and post-fill quantities for each asset.
+        #
+        # Three cases we detect:
+        #   1. qty_pre == 0 → qty_post > 0   : OPEN (new position)
+        #   2. qty_pre >  0 → qty_post == 0  : CLOSE (full exit)  ← attr write
+        #   3. qty_pre >  0 → qty_post < qty_pre: PARTIAL CLOSE   ← attr write
+        #   4. qty_pre >  0 → qty_post > qty_pre: ADD / RE-ENTRY   (skip)
+        #
+        # On any close (case 2 or 3), we:
+        #   - Update LanceDB ``nexus_decisions`` outcome field (via subprocess
+        #     bridge — same pattern as ``_run_memory_bridge``).
+        #   - If realized loss > ``attribution_loss_threshold_pct``, auto-write
+        #     a lesson to the ecosystem experience bank so future committees
+        #     can avoid repeating the mistake.
+        #
+        # The subprocess bridge is heavy (Qwen3-Embedding + LanceDB); to keep
+        # the on_fill hot path fast we defer it via ``attribution_bridge_mode``
+        # — "light" (default) only bridges on threshold-crossing losses,
+        # "heavy" bridges on every close.
+        # ──────────────────────────────────────────────────────────────
+
+        def _capture_pre_fill_state(self) -> None:
+            """Snapshot current positions BEFORE the next fill arrives.
+
+            Called from ``on_filled_order`` (with best-effort lookup of the
+            pre-state via the broker's already-cached positions) and from
+            the main iteration loop.  We use a best-effort dict snapshot —
+            ``self.get_position(symbol)`` could be slow on ccxt broker.
+            """
+            try:
+                positions = self.get_positions()
+                snap: dict[str, float] = {}
+                for p in positions:
+                    sym = getattr(p, "symbol", None)
+                    if sym is None and hasattr(p, "asset"):
+                        sym = getattr(p.asset, "symbol", None)
+                    if sym is None:
+                        continue
+                    snap[str(sym).upper()] = float(getattr(p, "quantity", 0) or 0)
+                self._pre_fill_qty = snap
+            except Exception as exc:
+                logger.debug("Failed to capture pre-fill state: %s", exc)
+
+        def _attribution_bridge_call(
+            self,
+            decision_id: str,
+            outcome: str,
+            pnl_pct: float,
+            symbol: str,
+        ) -> None:
+            """Update LanceDB outcome for *decision_id* via AQOS subprocess.
+
+            The lumibot venv does NOT have lancedb / sentence_transformers.
+            We invoke the AQOS venv (which has them) through a tiny
+            subprocess script that calls the existing
+            ``src.memory.bridge:update_decision_outcome()`` function once
+            we add it there. Until that helper lands, the bridge CLI is a
+            no-op for outcome updates — the local JSONL ``decisions.jsonl``
+            is the source of truth and will be re-bridged on next sync.
+            """
+            try:
+                from src.runners.attribution_bridge import update_outcome_via_subprocess
+                update_outcome_via_subprocess(
+                    decision_id=decision_id,
+                    outcome=outcome,
+                    pnl_pct=pnl_pct,
+                    symbol=symbol,
+                    strategy_name=self.__class__.__name__,
+                )
+            except Exception as exc:
+                logger.debug("Outcome bridge call failed (non-fatal): %s", exc)
+
+        def _attribution_write_loss_lesson(
+            self,
+            *,
+            symbol: str,
+            side: str,
+            entry_price: float,
+            exit_price: float,
+            realized_pnl_pct: float,
+            bars_held: int,
+            regime: str,
+            decision_id: str,
+        ) -> None:
+            """Auto-write a 'mistake' lesson when a closed position lost > threshold.
+
+            Two writes:
+              1. Subprocess → LanceDB ``lessons`` table (via AQOS bridge so
+                 future ``query_trade_memory`` calls surface the lesson).
+              2. In-process → ``remember_lesson_tool`` so the in-memory
+                 tool registry sees it this run (no embedding needed).
+            """
+            threshold = float(
+                self.parameters.get("attribution_loss_threshold_pct", 2.0)
+            )
+            if abs(realized_pnl_pct) < threshold:
+                return
+
+            # Truncate each side; a verbose traceback isn't actionable.
+            side_short = "long" if side.upper() == "LONG" else "short"
+            loss_text = (
+                f"Auto-loss on {symbol}: closed {side_short} after {bars_held} bars "
+                f"with realized PnL={realized_pnl_pct:+.2f}% (entry=${entry_price:.2f}, "
+                f"exit=${exit_price:.2f}, regime={regime}). "
+                f"Decision id={decision_id}. Threshold was {threshold:.1f}%. "
+                f"Lesson: review what triggered entry — likely a stale or weak thesis."
+            )
+
+            # ── 1. Subprocess bridge to LanceDB ──
+            try:
+                from src.runners.attribution_bridge import write_lesson_via_subprocess
+                write_lesson_via_subprocess(
+                    text=loss_text,
+                    category="mistake",
+                    severity="warning",
+                    symbol=symbol,
+                    regime=regime,
+                    tags=["attribution", "auto-loss", side_short],
+                )
+                logger.info(
+                    "Attribution: wrote loss lesson for %s (pnl=%.2f%%)",
+                    symbol, realized_pnl_pct,
+                )
+            except Exception as exc:
+                logger.debug("Attribution lesson bridge failed: %s", exc)
+
+            # ── 2. In-process remember_lesson (best-effort, fails silent) ──
+            try:
+                from src.tools.trade_memory_tool import remember_lesson_tool
+                remember_lesson_tool(
+                    text=loss_text[:1500],
+                    category="mistake",
+                    severity="warning",
+                    symbol=symbol,
+                    regime=regime,
+                    tags='["attribution", "auto-loss", "' + side_short + '"]',
+                )
+            except Exception as exc:
+                logger.debug("In-process remember_lesson failed: %s", exc)
+
+        def on_filled_order(
+            self,
+            position,
+            order,
+            price: float,
+            quantity: float,
+            multiplier: float,
+        ) -> None:
+            """LumiBot lifecycle hook — runs when an order is filled.
+
+            Synthesizes position-close detection (Lumibot 4.5.53 has no
+            ``on_position_closed`` hook). The diff is pre-fill vs post-fill
+            quantity for the order's asset symbol. See module docstring of
+            ``_attribution_*`` helpers for the full logic.
+            """
+            try:
+                # ── Extract order metadata ──
+                order_sym = ""
+                try:
+                    if order is not None and getattr(order, "asset", None) is not None:
+                        order_sym = str(getattr(order.asset, "symbol", "") or "")
+                except Exception:
+                    order_sym = ""
+                if not order_sym:
+                    order_sym = (
+                        str(getattr(position, "symbol", "") or "")
+                        if position is not None
+                        else ""
+                    )
+                order_sym = order_sym.upper()
+                is_buy = bool(order and getattr(order, "is_buy_order", lambda: False)())
+
+                # ── Capture PRE-fill quantity ──
+                # We don't always have it (first fill of the day, restart).
+                # Default to 0 so an open on the first fill works correctly.
+                pre_qty = float(self._pre_fill_qty.get(order_sym, 0.0))
+
+                # ── POST-fill quantity: prefer the Position object passed
+                #    in by Lumibot (already has the post-fill quantity).
+                post_qty = float(getattr(position, "quantity", 0.0) or 0.0)
+                if position is None:
+                    # Fallback: query the broker directly.
+                    try:
+                        post_pos = self.get_position(order_sym)
+                        post_qty = float(getattr(post_pos, "quantity", 0.0) or 0.0)
+                    except Exception:
+                        pass
+
+                # Refresh the cache so the NEXT on_filled_order sees the
+                # post-state for this asset.
+                self._pre_fill_qty[order_sym] = post_qty
+                self._fills_processed += 1
+
+                side = "LONG" if is_buy else "SHORT"
+                bars_held = 0
+                entry_price = 0.0
+
+                # ── Decide: open / close / partial / add ──
+                if pre_qty == 0.0 and post_qty > 0.0:
+                    # OPEN — record entry context for later outcome computation
+                    # Pull the decision_id for this symbol from the
+                    # per-symbol mapping populated by the AQS sync path.
+                    ids = getattr(self.vars, "last_decision_ids_by_symbol", {}) or {}
+                    sym_decision_id = ids.get(order_sym, "") or getattr(self.vars, "last_decision_id", "") or ""
+                    self._pending_outcomes[order_sym] = {
+                        "side": side,
+                        "entry_price": float(price or 0.0),
+                        "entry_sim_time": (
+                            self.get_datetime().isoformat()
+                            if hasattr(self, "get_datetime")
+                            else ""
+                        ),
+                        "decision_id": sym_decision_id,
+                    }
+                    logger.info(
+                        "[B1] Position OPEN: %s side=%s qty=%.6f price=%.2f",
+                        order_sym, side, post_qty, price,
+                    )
+                    return
+
+                if pre_qty > 0.0 and post_qty == 0.0:
+                    # FULL CLOSE — compute realized PnL and update LanceDB
+                    pending = self._pending_outcomes.pop(
+                        order_sym,
+                        {"side": side, "entry_price": 0.0, "entry_sim_time": "", "decision_id": ""},
+                    )
+                    entry_price = float(pending.get("entry_price", 0.0) or 0.0)
+                    side = pending.get("side", side)
+                    # If pending is the default empty dict (no entry recorded
+                    # this run — e.g., position inherited at startup), try
+                    # the per-symbol decision_ids_by_symbol mapping AND fall
+                    # back to the broker's ``avg_fill_price`` for entry.
+                    if not pending.get("decision_id"):
+                        ids = getattr(self.vars, "last_decision_ids_by_symbol", {}) or {}
+                        pending["decision_id"] = (
+                            ids.get(order_sym, "")
+                            or getattr(self.vars, "last_decision_id", "")
+                            or ""
+                        )
+                    if entry_price <= 0.0:
+                        # Try the position's avg_fill_price as a fallback
+                        # (Lumibot stores the open cost basis on the position).
+                        try:
+                            fallback_entry = float(getattr(position, "avg_fill_price", 0.0) or 0.0)
+                            if fallback_entry > 0.0:
+                                entry_price = fallback_entry
+                                # Inherited position: if pending_outcomes
+                                # doesn't have a side, infer from the
+                                # pre-fill quantity sign — positive means
+                                # we were LONG (selling closes), negative
+                                # means SHORT (buying covers).
+                                if pre_qty > 0.0 and not pending.get("side_was_set"):
+                                    side = "LONG"
+                                elif pre_qty < 0.0:
+                                    side = "SHORT"
+                        except Exception:
+                            pass
+                    # Long close: (exit - entry)/entry; short close: (entry - exit)/entry
+                    if entry_price > 0:
+                        if side == "LONG":
+                            realized_pnl_pct = (float(price) - entry_price) / entry_price * 100.0
+                        else:
+                            realized_pnl_pct = (entry_price - float(price)) / entry_price * 100.0
+                    else:
+                        realized_pnl_pct = 0.0
+
+                    self._closes_processed += 1
+                    outcome = "win" if realized_pnl_pct > 0 else "loss"
+                    logger.info(
+                        "[B1] Position CLOSE: %s side=%s entry=%.2f exit=%.2f pnl=%.2f%% outcome=%s",
+                        order_sym, side, entry_price, float(price), realized_pnl_pct, outcome,
+                    )
+
+                    # Update LanceDB outcome + maybe auto-write loss lesson
+                    decision_id = pending.get("decision_id", "")
+                    if decision_id:
+                        bridge_mode = self.parameters.get(
+                            "attribution_bridge_mode", "light",
+                        )
+                        # "light" → bridge only on losses > threshold;
+                        # "heavy" → bridge every close.
+                        threshold = float(
+                            self.parameters.get("attribution_loss_threshold_pct", 2.0)
+                        )
+                        should_bridge = (
+                            bridge_mode == "heavy"
+                            or (outcome == "loss" and abs(realized_pnl_pct) > threshold)
+                        )
+                        if should_bridge:
+                            self._attribution_bridge_call(
+                                decision_id=decision_id,
+                                outcome=outcome,
+                                pnl_pct=realized_pnl_pct,
+                                symbol=order_sym,
+                            )
+
+                    # Auto-write lesson on threshold-crossing loss
+                    if outcome == "loss" and abs(realized_pnl_pct) > float(
+                        self.parameters.get("attribution_loss_threshold_pct", 2.0)
+                    ):
+                        regime = getattr(self.vars, "current_regime", "unknown") or "unknown"
+                        self._attribution_write_loss_lesson(
+                            symbol=order_sym,
+                            side=side,
+                            entry_price=entry_price,
+                            exit_price=float(price),
+                            realized_pnl_pct=realized_pnl_pct,
+                            bars_held=bars_held,
+                            regime=regime,
+                            decision_id=decision_id,
+                        )
+                    return
+
+                if pre_qty > 0.0 and 0.0 < post_qty < pre_qty:
+                    # PARTIAL CLOSE — treat as a CLOSE for the closed slice
+                    pending = self._pending_outcomes.get(
+                        order_sym,
+                        {"side": side, "entry_price": 0.0, "entry_sim_time": "", "decision_id": ""},
+                    )
+                    entry_price = float(pending.get("entry_price", 0.0) or 0.0)
+                    side = pending.get("side", side)
+                    # If pending is the default empty dict (no entry recorded
+                    # this run — e.g., position inherited at startup), try
+                    # the per-symbol decision_ids_by_symbol mapping AND fall
+                    # back to the broker's ``avg_fill_price`` for entry.
+                    if not pending.get("decision_id"):
+                        ids = getattr(self.vars, "last_decision_ids_by_symbol", {}) or {}
+                        pending["decision_id"] = (
+                            ids.get(order_sym, "")
+                            or getattr(self.vars, "last_decision_id", "")
+                            or ""
+                        )
+                    if entry_price <= 0.0:
+                        try:
+                            fallback_entry = float(getattr(position, "avg_fill_price", 0.0) or 0.0)
+                            if fallback_entry > 0.0:
+                                entry_price = fallback_entry
+                        except Exception:
+                            pass
+                    if entry_price > 0:
+                        if side == "LONG":
+                            realized_pnl_pct = (float(price) - entry_price) / entry_price * 100.0
+                        else:
+                            realized_pnl_pct = (entry_price - float(price)) / entry_price * 100.0
+                    else:
+                        realized_pnl_pct = 0.0
+                    self._closes_processed += 1
+                    outcome = "win" if realized_pnl_pct > 0 else "loss"
+                    logger.info(
+                        "[B1] Position PARTIAL CLOSE: %s side=%s entry=%.2f exit=%.2f pnl=%.2f%% outcome=%s",
+                        order_sym, side, entry_price, float(price), realized_pnl_pct, outcome,
+                    )
+                    # Update pending entry_price for the remaining slice
+                    if order_sym in self._pending_outcomes:
+                        self._pending_outcomes[order_sym]["entry_price"] = (
+                            entry_price  # keep the original entry for the rest
+                        )
+                    decision_id = pending.get("decision_id", "")
+                    if decision_id:
+                        bridge_mode = self.parameters.get("attribution_bridge_mode", "light")
+                        threshold = float(
+                            self.parameters.get("attribution_loss_threshold_pct", 2.0)
+                        )
+                        should_bridge = (
+                            bridge_mode == "heavy"
+                            or (outcome == "loss" and abs(realized_pnl_pct) > threshold)
+                        )
+                        if should_bridge:
+                            self._attribution_bridge_call(
+                                decision_id=decision_id,
+                                outcome=outcome,
+                                pnl_pct=realized_pnl_pct,
+                                symbol=order_sym,
+                            )
+                    if outcome == "loss" and abs(realized_pnl_pct) > float(
+                        self.parameters.get("attribution_loss_threshold_pct", 2.0)
+                    ):
+                        regime = getattr(self.vars, "current_regime", "unknown") or "unknown"
+                        self._attribution_write_loss_lesson(
+                            symbol=order_sym,
+                            side=side,
+                            entry_price=entry_price,
+                            exit_price=float(price),
+                            realized_pnl_pct=realized_pnl_pct,
+                            bars_held=bars_held,
+                            regime=regime,
+                            decision_id=decision_id,
+                        )
+                    return
+
+                if pre_qty > 0.0 and post_qty > pre_qty:
+                    # ADD / RE-ENTRY — keep prior entry context as the
+                    # weighted-avg lives on the broker. Just refresh.
+                    logger.debug(
+                        "[B1] Position ADD: %s pre=%.6f post=%.6f",
+                        order_sym, pre_qty, post_qty,
+                    )
+                    return
+
+                # Fallback: pre_qty == 0 and post_qty == 0 → likely a rejected
+                # or immediately-cancelled fill. Ignore.
+                logger.debug(
+                    "[B1] Fill no-op: %s pre=%.6f post=%.6f buy=%s",
+                    order_sym, pre_qty, post_qty, is_buy,
+                )
+
+            except Exception as exc:
+                # Never crash the strategy on an attribution bug.
+                logger.exception("on_filled_order attribution failed: %s", exc)
 
     return PaperTradeCommitteeStrategy
 
