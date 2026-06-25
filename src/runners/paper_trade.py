@@ -89,7 +89,20 @@ def load_strategy_fn(strategy_name: str):
 
 
 def get_wf_validated_strategies() -> dict:
-    """Get the best WF-validated strategy per asset from nexus_results.duckdb."""
+    """Get the best WF-validated strategy per asset from nexus_results.duckdb.
+
+    Sortino-first ranking: penalizes only downside volatility (the risk
+    that actually hurts PnL for long-biased crypto). Sharpe is the
+    tiebreaker. Falls back to Sharpe-only ranking when the
+    ``walk_forward_results`` table is missing the ``sortino`` column
+    (legacy WF runs before 2026-06-25).
+
+    On startup, if the table lacks a ``sortino`` column, this function
+    will ALTER TABLE to add it as a nullable DOUBLE. The next walk-forward
+    run (src/runners/walk_forward_validation.py) will populate it. Until
+    that happens, this function falls back to AVG(sharpe) only and logs
+    a warning so it's visible in the bot startup banner.
+    """
     import duckdb
 
     db_path = str(NEXUS_ROOT / "data" / "nexus_results.duckdb")
@@ -97,29 +110,118 @@ def get_wf_validated_strategies() -> dict:
         logger.warning("nexus_results.duckdb not found — using defaults")
         return {asset: cfg["default_strategy"] for asset, cfg in PORTFOLIO.items()}
 
+    # Use a writable connection so we can ALTER TABLE if the ``sortino``
+    # column is missing. Read-only mode would block the migration; we
+    # only ever issue one ALTER TABLE ADD COLUMN (idempotent via IF NOT
+    # EXISTS) and then downgrade to read-only for the actual query.
+    has_sortino_column = False
+    try:
+        con = duckdb.connect(db_path, read_only=False)
+        try:
+            # Check schema for the sortino column. ``DESCRIBE`` returns
+            # one row per column; an empty result means the table doesn't
+            # exist (fresh DB).
+            try:
+                cols = con.execute(
+                    "DESCRIBE walk_forward_results"
+                ).fetchall()
+            except Exception:
+                # Table doesn't exist — nothing to migrate
+                cols = []
+
+            col_names = {row[0].lower() for row in cols}
+            if cols and "sortino" not in col_names:
+                # ALTER TABLE ADD COLUMN IF NOT EXISTS is idempotent
+                # (DuckDB 0.10+). Use IF NOT EXISTS so a partial migration
+                # doesn't blow up on next startup.
+                try:
+                    con.execute(
+                        "ALTER TABLE walk_forward_results "
+                        "ADD COLUMN IF NOT EXISTS sortino DOUBLE"
+                    )
+                    logger.info(
+                        "walk_forward_results: added 'sortino' DOUBLE column "
+                        "(nullable; walk-forward runner will populate on next run)"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "walk_forward_results: could not add 'sortino' column "
+                        "(%s); falling back to Sharpe-only ranking", exc,
+                    )
+                # Re-check; if ALTER succeeded we're good, otherwise
+                # has_sortino_column stays False and we fall back.
+                cols2 = con.execute(
+                    "DESCRIBE walk_forward_results"
+                ).fetchall()
+                col_names = {row[0].lower() for row in cols2}
+
+            has_sortino_column = "sortino" in col_names
+        finally:
+            con.close()
+    except Exception as exc:
+        logger.warning(
+            "Could not inspect walk_forward_results schema (%s); "
+            "falling back to Sharpe-only ranking", exc,
+        )
+
+    # Re-open in read-only mode for the actual ranking query.
     con = duckdb.connect(db_path, read_only=True)
     try:
-        # Get best strategy per asset by avg Sharpe
-        rows = con.execute("""
-            SELECT symbol, strategy_name
-            FROM (
-                SELECT
-                    strategy_name, symbol,
-                    AVG(sharpe) as avg_sharpe,
-                    AVG(total_return_pct) as avg_return,
-                    SUM(CASE WHEN profitable THEN 1 ELSE 0 END) as n_profitable,
-                    COUNT(*) as n_windows,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY AVG(sharpe) DESC) as rn
-                FROM walk_forward_results
-                GROUP BY strategy_name, symbol
-            ) ranked
-            WHERE rn = 1
-              AND n_profitable >= 3
-              AND avg_sharpe > 0
-            ORDER BY symbol
-        """).fetchall()
+        if has_sortino_column:
+            # Sortino-first ranking. ``sortino`` is nullable (column added
+            # 2026-06-25; older WF runs have NULL and sort to the bottom
+            # via NULLS LAST). Sharpe is the tiebreaker.
+            rows = con.execute("""
+                SELECT symbol, strategy_name
+                FROM (
+                    SELECT
+                        strategy_name, symbol,
+                        AVG(sortino) as avg_sortino,
+                        AVG(sharpe) as avg_sharpe,
+                        AVG(total_return_pct) as avg_return,
+                        SUM(CASE WHEN profitable THEN 1 ELSE 0 END) as n_profitable,
+                        COUNT(*) as n_windows,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY symbol
+                            ORDER BY AVG(sortino) DESC NULLS LAST,
+                                     AVG(sharpe) DESC NULLS LAST
+                        ) as rn
+                    FROM walk_forward_results
+                    GROUP BY strategy_name, symbol
+                ) ranked
+                WHERE rn = 1
+                  AND n_profitable >= 3
+                  AND (avg_sortino > 0 OR (avg_sortino IS NULL AND avg_sharpe > 0))
+                ORDER BY symbol
+            """).fetchall()
+        else:
+            # Fallback: legacy schema with only ``sharpe``. Log a warning
+            # so it's visible at bot startup.
+            logger.warning(
+                "walk_forward_results has no 'sortino' column — falling back to "
+                "Sharpe-only ranking. Run src.runners.walk_forward_validation "
+                "to populate Sortino for future folds."
+            )
+            rows = con.execute("""
+                SELECT symbol, strategy_name
+                FROM (
+                    SELECT
+                        strategy_name, symbol,
+                        AVG(sharpe) as avg_sharpe,
+                        AVG(total_return_pct) as avg_return,
+                        SUM(CASE WHEN profitable THEN 1 ELSE 0 END) as n_profitable,
+                        COUNT(*) as n_windows,
+                        ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY AVG(sharpe) DESC) as rn
+                    FROM walk_forward_results
+                    GROUP BY strategy_name, symbol
+                ) ranked
+                WHERE rn = 1
+                  AND n_profitable >= 3
+                  AND avg_sharpe > 0
+                ORDER BY symbol
+            """).fetchall()
     except Exception:
-        # Table might not exist yet
+        # Table might not exist yet — fresh DB after first ALTER migration
         return {asset: cfg["default_strategy"] for asset, cfg in PORTFOLIO.items()}
     finally:
         con.close()
