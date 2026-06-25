@@ -186,6 +186,15 @@ class NexusCommitteeStrategy(Strategy):
         self.vars.last_decision_action = ""
         self.vars.last_decision_confidence = ""
         self.vars.committee_run_count = 0
+        # B1 attribution (2026-06-25): the most recent decision's stable
+        # ID so the on_filled_order hook can patch its outcome/pnl once
+        # the position closes.
+        self.vars.last_decision_id = ""
+        # Mapping of symbol -> decision_id for the most recent open
+        # position(s). Updated by the order-submission loop in the PM
+        # agent; consumed by PaperTradeCommitteeStrategy.on_filled_order
+        # to attach outcomes to the right decision.
+        self.vars.last_decision_ids_by_symbol: dict[str, str] = {}
 
         # Notifications (Telegram, email)
         if self.parameters.get("enable_notifications"):
@@ -635,6 +644,25 @@ sys.stdout.flush()
             except Exception:
                 self.vars.last_decision_confidence = ""
 
+            # B1 attribution (2026-06-25): record the decision id so the
+            # PaperTradeCommitteeStrategy.on_filled_order hook can patch
+            # this row's outcome/pnl once the position closes.
+            try:
+                if action in ("buy", "sell"):
+                    decision_id = f"decision_{ts[:19].replace(':', '').replace('-', '')}_{symbol}_{action}"
+                    self.vars.last_decision_id = decision_id
+                    ids = getattr(self.vars, "last_decision_ids_by_symbol", None)
+                    if ids is None:
+                        ids = {}
+                        self.vars.last_decision_ids_by_symbol = ids
+                    ids[symbol.upper()] = decision_id
+                    logger.debug(
+                        "[NexusCommittee run %d] B1: recorded decision_id=%s for symbol=%s",
+                        run, decision_id, symbol,
+                    )
+            except Exception:
+                logger.debug("B1 last_decision_id capture failed (non-fatal)", exc_info=True)
+
             # Write decision to agent_memory
             sync_committee_decision({
                 "symbol": symbol,
@@ -763,15 +791,46 @@ sys.stdout.flush()
                             lakehouse_regimes[sym] = reg
                     context["lakehouse_regimes"] = lakehouse_regimes
                     context["lakehouse_available"] = True
-                    # Include strategy candidates from pool
-                    strats = lakehouse.get_strategy_pool(min_composite=49.0, limit=10)
+                    # Include strategy candidates from pool — Sortino-first
+                    # ranking (penalizes only downside vol, better metric for
+                    # asymmetric crypto payoffs). Falls back to Sharpe, then
+                    # composite_score, so missing columns never break this.
+                    strats = lakehouse.get_strategy_pool(
+                        min_composite=49.0, sort_by="sortino", limit=10,
+                    )
                     if strats:
                         context["lakehouse_strategy_candidates"] = [
-                            {"name": s.get("strategy_name"), "sharpe": s.get("sharpe"),
-                             "composite": s.get("composite_score"), "status": s.get("status"),
+                            {"name": s.get("strategy_name"),
+                             "sharpe": s.get("sharpe"),
+                             "sortino": s.get("sortino"),
+                             "composite": s.get("composite_score"),
+                             "status": s.get("status"),
                              "ticker": s.get("ticker")}
                             for s in strats[:5]
                         ]
+                    # Top regime-fit strategies ranked by Sortino (NEW):
+                    # if we have a current regime, surface the strategies that
+                    # historically did well in it — ranked by Sortino first.
+                    try:
+                        current_regime = context.get("current_regime", "unknown")
+                        if current_regime and current_regime != "unknown":
+                            top_regime_strats = lakehouse.get_top_regime_strategies_by_sortino(
+                                regime_label=current_regime, min_sortino=0.0, limit=5,
+                            )
+                            if top_regime_strats:
+                                context["top_regime_strategies"] = [
+                                    {"name": s.get("strategy_name"),
+                                     "asset": s.get("asset") or s.get("ticker"),
+                                     "regime_label": s.get("regime_label"),
+                                     "n_trades": s.get("n_trades") or s.get("sample_count"),
+                                     "sharpe_ratio": s.get("sharpe_ratio") or s.get("avg_sharpe"),
+                                     "sortino_ratio": s.get("sortino_ratio") or s.get("avg_sortino"),
+                                     "win_rate": s.get("win_rate"),
+                                     "max_drawdown": s.get("max_drawdown")}
+                                    for s in top_regime_strats
+                                ]
+                    except Exception as exc:
+                        logger.debug("top_regime_strategies lookup failed: %s", exc)
                     # Include recent failures for awareness
                     failures = lakehouse.get_failures(limit=10)
                     if failures:
@@ -818,8 +877,14 @@ Lakehouse tools (if available — these pull from the quant ecosystem lakehouse)
    regime-intelligence (confidence-filtered).
 8. **lakehouse_factors(ticker)** — factor snapshot from alpha-factory.
 9. **lakehouse_strategy_candidates(regime)** — promoted strategies with Sharpe>1.0.
+   The query now ranks by **Sortino** (penalizes only downside volatility) over
+   Sharpe — better metric for asymmetric crypto payoffs.
 10. **lakehouse_preflight(strategy_name, ticker)** — check failure history before trading.
-11. Any built-in tools for price data, news, fundamentals.
+11. **query_walkforward_memory(symbol, regime, n_results)** — NEW. Search the
+    walk-forward validation memory bank for prior OOS windows of strategies
+    tested on this symbol/regime. Returns Sharpe + Sortino + profitable-window
+    counts. Use this to surface strategies with strong cross-regime OOS evidence.
+12. Any built-in tools for price data, news, fundamentals.
 
 If lakehouse tools are available, ALWAYS use lakehouse_intelligence as your first
 source for each ticker — it aggregates everything. Supplement with signal_dashboard
@@ -847,8 +912,10 @@ Build the strongest long-only case from the evidence pack. You may use:
 - **query_trade_memory(query, symbol, regime)** to find historical winning patterns
 - **lakehouse_intelligence(ticker)** for aggregated lakehouse data per ticker
 - **lakehouse_factors(ticker)** for alpha-factory factor analysis
-- **lakehouse_strategy_candidates(regime)** for strategies that work in current regime
+- **lakehouse_strategy_candidates(regime)** for strategies that work in current regime.
+  Ranked by **Sortino** first (penalizes only downside volatility), then Sharpe.
 - **lakehouse_experience(ticker)** for lessons from the quant ecosystem
+- **query_walkforward_memory(symbol, regime, n_results)** — OOS window history
 - Any read-only tools to dig deeper
 
 Focus on:
@@ -921,11 +988,19 @@ Before trading:
    persist important lessons to the ecosystem experience bank for cross-project learning.
 10. **Use query_stratforge_strategies** to discover best-fit strategies from
     the StratForge lakehouse. Query by symbol and min composite score to find
-    validated strategies with strong walk-forward Sharpe ratios. Use this to
-    select which strategy to load for the current market conditions.
+    validated strategies with strong walk-forward Sharpe + Sortino ratios. Use
+    this to select which strategy to load for the current market conditions.
+    **Sortino is the primary ranking metric** (penalizes only downside
+    volatility — what actually hurts PnL for a long-biased crypto book).
+    Sharpe is now a tiebreaker, not the lead.
+11. **Use query_walkforward_memory(symbol, regime, n_results)** to surface
+    strategies with strong OOS evidence from prior walk-forward windows on
+    the same symbol + regime. Returns Sharpe + Sortino + profitable counts
+    so you can see how the candidate behaved across historical OOS windows.
 
 Use these memory tools:
 - **query_trade_memory** — check what history tells us about similar setups
+- **query_walkforward_memory** — OOS walk-forward history for this symbol/regime
 - **remember_decision** — persist this decision for future reference
 - **remember_lesson** — capture lessons for the experience bank
 - **lakehouse_preflight(strategy_name, ticker)** — check ecosystem failures before trading
@@ -938,6 +1013,19 @@ Return:
 - Risk controls applied
 - Why the bear case was accepted or rejected
 - Monitoring points and invalidation levels
+
+**Sortino-aware commentary (required):** in the decision narrative, call
+out each candidate's **Sortino ratio** alongside its Sharpe — Sortino is
+the primary risk-adjusted metric (penalizes only downside volatility,
+which is what actually hurts a long-biased crypto book) and Sharpe is
+the tiebreaker. If a candidate is Sharpe-only (no Sortino yet, e.g. a
+brand-new walk-forward fold), say so explicitly and treat the ranking
+as provisional until Sortino is populated. If the top Sortino in the
+candidates list is < 1.0, prefer HOLD and explain why the upside-vs-
+downside asymmetry doesn't justify entry at current sizing. Conversely,
+if Sortino > 2.0 with Sharpe > 1.0, that's the green light for
+full-size entry. Surface this in the decision text, not buried in
+footnotes — the persistence layer indexes on the decision narrative.
 """
 
 
