@@ -326,7 +326,7 @@ class NexusCommitteeStrategy(Strategy):
         try:
             from src.memory.bridge import MemoryBridge
 
-            bridge = MemoryBridge(strategy_name="Nexus_Trader")
+            bridge = MemoryBridge(strategy_name="NexusCommitteeStrategy")
             stats = bridge.sync_all()
             total = sum(stats.get(k, {}).get("embedded", 0) for k in ("decisions", "lessons", "theses", "memories"))
             if total > 0:

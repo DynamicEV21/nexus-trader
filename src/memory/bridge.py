@@ -13,7 +13,7 @@ Usage
 Or programmatically:
 
     from nexus_trade.memory.bridge import MemoryBridge
-    bridge = MemoryBridge("Nexus_Trader")
+    bridge = MemoryBridge("NexusCommitteeStrategy")
     stats = bridge.sync_all()
 
 Key design principles
@@ -88,7 +88,7 @@ class MemoryBridge:
 
     def __init__(
         self,
-        strategy_name: str = "Nexus_Trader",
+        strategy_name: str = "NexusCommitteeStrategy",
         memory_dir: str | None = None,
         nexus_memory = None,
     ) -> None:
