@@ -61,14 +61,25 @@ def _make_strategy_stub():
 
 
 def _make_order(symbol: str, is_buy: bool, qty: float):
-    order = MagicMock()
-    order.asset.symbol = symbol
-    order.is_buy_order.return_value = is_buy
+    """Plain-attribute Order stub. Using a real class instead of MagicMock
+    because MagicMock auto-intercepts getattr() and returns MagicMock objects
+    for unset attrs, which breaks ``getattr(..., default)`` fall-throughs
+    used by the B1 attribution logic."""
+    class _Order:
+        pass
+    order = _Order()
+    order.asset = type("Asset", (), {"symbol": symbol})()
+    order.is_buy_order = lambda: is_buy
+    order.quantity = qty
+    order.side = "buy" if is_buy else "sell"
     return order
 
 
 def _make_position(symbol: str, qty: float, avg_fill_price: float = 100.0):
-    pos = MagicMock()
+    """Plain-attribute Position stub. See _make_order for why we avoid MagicMock."""
+    class _Position:
+        pass
+    pos = _Position()
     pos.symbol = symbol
     pos.quantity = qty
     pos.avg_fill_price = avg_fill_price
@@ -208,7 +219,12 @@ class B1AttributionTests(unittest.TestCase):
         s.vars.last_decision_ids_by_symbol["BTC"] = "decision_inherited_btc"
         order = _make_order("BTC", is_buy=False, qty=0.5)
         # Position inherits from a prior run: avg_fill_price = $50k.
-        position = MagicMock()
+        # Plain-attribute stub (MagicMock would intercept getattr and
+        # return MagicMock objects for avg_fill_price, breaking the
+        # fallback path that reads entry_price from it).
+        class _Pos:
+            pass
+        position = _Pos()
         position.symbol = "BTC"
         position.quantity = 0.0
         position.avg_fill_price = 50000.0
