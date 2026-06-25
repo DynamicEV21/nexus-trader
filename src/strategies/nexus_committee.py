@@ -60,6 +60,7 @@ import os
 import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 # Ensure Nexus Trader src is importable
@@ -322,19 +323,104 @@ class NexusCommitteeStrategy(Strategy):
             return []
 
     def _run_memory_bridge(self) -> None:
-        """Sync LumiBot JSONL memory into vector memory (non-blocking, best-effort)."""
-        try:
-            from src.memory.bridge import MemoryBridge
+        """Sync LumiBot JSONL memory into vector memory via AQOS subprocess.
 
-            bridge = MemoryBridge(strategy_name="NexusCommitteeStrategy")
-            stats = bridge.sync_all()
-            total = sum(stats.get(k, {}).get("embedded", 0) for k in ("decisions", "lessons", "theses", "memories"))
-            if total > 0:
-                logger.info("Memory bridge synced %d entries", total)
-            else:
-                logger.debug("Memory bridge: no new entries to sync")
-        except Exception:
-            logger.debug("Memory bridge not available — continuing without", exc_info=True)
+        Why subprocess (not in-process)?
+        --------------------------------
+        The vector memory stack (lancedb + sentence-transformers + Qwen3-Embedding)
+        lives in the agentic-quant-os venv — not in the lumibot venv. An in-process
+        bridge import would fail because the lumibot venv guard explicitly prevents
+        lancedb from being installed there (commit e2b93a0 — fail-loud if found).
+
+        So we spawn the AQOS venv python with PYTHONPATH pointing at the nexus-trade
+        src tree and call the bridge CLI. The AQOS subprocess reads our JSONL files,
+        embeds them with Qwen3-Embedding-0.6B, and stores in the shared LanceDB
+        directory at ~/development/agentic-quant-os/data/vectors/.
+
+        Non-blocking and best-effort: we use subprocess.run with a 600s timeout
+        (CPU embedding is slow). If the AQOS venv is missing or the subprocess
+        fails for any reason, we log and continue — the bot never crashes
+        because the bridge is unavailable.
+        """
+        aqos_python = "/home/Zev/development/agentic-quant-os/.venv/bin/python"
+        nexus_src = "/home/Zev/development/nexus-trade/src"
+
+        if not Path(aqos_python).exists():
+            logger.debug("AQOS venv not found at %s — skipping memory bridge", aqos_python)
+            return
+
+        # Env: PYTHONPATH for src.memory.bridge, NEXUS_MEMORY_DIR for data location
+        bridge_env = {
+            **os.environ,
+            "PYTHONPATH": nexus_src,
+            "NEXUS_MEMORY_DIR": os.environ.get(
+                "NEXUS_MEMORY_DIR",
+                str(Path.home() / "development" / "nexus-trade" / ".lumibot" / "memory"),
+            ),
+        }
+
+        # Use a small Python wrapper that returns stats as JSON on stdout.
+        # Calling bridge.sync_all() directly via -c is more reliable than the
+        # __main__ CLI (the CLI prints intermediate log lines to stdout).
+        wrapper_script = """
+import sys, json
+sys.path.insert(0, {nexus_src!r})
+from src.memory.bridge import MemoryBridge
+b = MemoryBridge(strategy_name="NexusCommitteeStrategy")
+stats = b.sync_all()
+sys.stdout.write("__BRIDGE_RESULT__" + json.dumps(stats, default=str))
+sys.stdout.flush()
+""".format(nexus_src=nexus_src)
+
+        try:
+            result = subprocess.run(
+                [aqos_python, "-c", wrapper_script],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                env=bridge_env,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Memory bridge subprocess timed out after 600s")
+            return
+        except Exception as exc:
+            logger.debug("Memory bridge subprocess failed to launch: %s", exc)
+            return
+
+        # Parse __BRIDGE_RESULT__ from stdout (stderr may contain INFO/DEBUG logs)
+        if result.returncode != 0:
+            logger.warning(
+                "Memory bridge subprocess exited with code %d: %s",
+                result.returncode,
+                (result.stderr or "")[-200:],
+            )
+            return
+
+        stdout = result.stdout or ""
+        marker = "__BRIDGE_RESULT__"
+        if marker not in stdout:
+            logger.warning("Memory bridge subprocess returned no result marker")
+            return
+
+        try:
+            stats = json.loads(stdout.split(marker, 1)[1].strip())
+        except Exception as exc:
+            logger.warning("Memory bridge: failed to parse JSON stats: %s", exc)
+            return
+
+        total = sum(stats.get(k, {}).get("embedded", 0) for k in ("decisions", "lessons", "theses", "memories"))
+        errors = sum(stats.get(k, {}).get("errors", 0) for k in ("decisions", "lessons", "theses", "memories"))
+        nexus_stats = stats.get("nexus_stats", {})
+
+        if total > 0 or errors > 0:
+            logger.info(
+                "Memory bridge (subprocess): embedded=%d errors=%d (LanceDB: %s)",
+                total,
+                errors,
+                nexus_stats,
+            )
+        else:
+            logger.debug("Memory bridge (subprocess): no new entries to sync")
 
     # ------------------------------------------------------------------
     # Trading iteration — the committee session
