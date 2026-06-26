@@ -160,6 +160,12 @@ class NexusCommitteeStrategy(Strategy):
         "max_new_positions_per_run": 2,
         "enable_notifications": False,
         "use_memory_bridge": True,
+        # 2026-06-26: asset-class routing for the lakehouse strategy pool.
+        # ``crypto`` (default) reads v_nexus_strategy_pool_crypto
+        # (BTC/ETH/SOL/ALL/MULTI universe with sortino + composite_score);
+        # ``stocks`` reads v_nexus_strategy_pool_stocks (20 MAS strategies
+        # with Sharpe-only metrics, no sortino/composite).
+        "asset_class": "crypto",
     }
 
     # ------------------------------------------------------------------
@@ -1030,10 +1036,36 @@ Return:
 """
 
     def _portfolio_manager_prompt(self) -> str:
-        return """
+        # 2026-06-26: asset-class aware. The active ``asset_class`` is
+        # pulled from strategy parameters so the PM prompt matches the
+        # lakehouse split: crypto uses sortino+composite_score ranking,
+        # stocks use Sharpe-only (their strategy pool has NULL sortino).
+        asset_class = (self.parameters.get("asset_class") or "crypto").lower()
+        if asset_class == "stocks":
+            asset_class_block = """
+ASSET CLASS: STOCKS (traditional equities via quant-research-mas strategies).
+- Ranking metric is **Sharpe** (the stock pool has NULL sortino +
+  composite_score; do not pretend they're missing — they're by design).
+- Tickers in v_nexus_strategy_pool_stocks are category labels
+  (e.g. 'STOCKS', 'TECH', 'SPY') not specific equities. For US equities
+  research you'd query v_nexus_strategy_pool_crypto for crypto or
+  backtest a single-symbol stock strategy separately.
+- Min_composite filter is auto-disabled for stocks (set min_composite=0).
+"""
+        else:
+            asset_class_block = """
+ASSET CLASS: CRYPTO (BTC/ETH/SOL/ALL/MULTI perpetuals via StratForge).
+- Ranking metric is **Sortino** (primary) + **Sharpe** (tiebreaker) +
+  **composite_score** (final tiebreaker). Sortino penalizes only downside
+  volatility — what actually hurts PnL for a long-biased crypto book.
+- Top Sortino >= 1.0 with Sharpe > 0 is the green light; < 0.5 prefer HOLD.
+"""
+        return f"""
 You are the Portfolio Manager for a long-only LumiBot strategy.
 
 You may place real LumiBot orders, but only within the strategy risk limits.
+
+{asset_class_block}
 
 Before trading:
 1. Check current portfolio, positions, open orders, and available cash.
@@ -1049,13 +1081,12 @@ Before trading:
    call remember_lesson to store them.
 9. **If lakehouse tools are available**, use lakehouse_write_lesson to
    persist important lessons to the ecosystem experience bank for cross-project learning.
-10. **Use query_stratforge_strategies** to discover best-fit strategies from
-    the StratForge lakehouse. Query by symbol and min composite score to find
-    validated strategies with strong walk-forward Sharpe + Sortino ratios. Use
-    this to select which strategy to load for the current market conditions.
-    **Sortino is the primary ranking metric** (penalizes only downside
-    volatility — what actually hurts PnL for a long-biased crypto book).
-    Sharpe is now a tiebreaker, not the lead.
+10. **Use lakehouse_strategy_candidates** (pass asset_class='{asset_class}')
+    to discover best-fit strategies from the StratForge lakehouse. Query by
+    symbol and min composite score (or min_sharpe for stocks) to find
+    validated strategies with strong walk-forward Sharpe + Sortino ratios.
+    Use this to select which strategy to load for the current market
+    conditions.
 11. **Use query_walkforward_memory(symbol, regime, n_results)** to surface
     strategies with strong OOS evidence from prior walk-forward windows on
     the same symbol + regime. Returns Sharpe + Sortino + profitable counts

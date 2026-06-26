@@ -145,33 +145,45 @@ def lakehouse_strategy_candidates(
     min_sortino: float = 0.0,
     ticker: str = "",
     limit: int = 10,
+    asset_class: str = "crypto",
 ) -> dict[str, Any]:
-    """Get validated crypto strategy candidates from the lakehouse.
+    """Get validated strategy candidates from the lakehouse.
 
-    Returns strategies from the corrected ``v_nexus_strategy_pool`` view
-    which reads from ``backtest_results_v2`` (crypto strategies only).
+    Asset-class routing (2026-06-26):
+      - ``asset_class='crypto'`` (default) → reads from
+        ``v_nexus_strategy_pool_crypto`` (the canonical crypto pool;
+        BTC/ETH/SOL/ALL/MULTI tickers with sortino/composite_score).
+      - ``asset_class='stocks'`` → reads from
+        ``v_nexus_strategy_pool_stocks`` (20 MAS strategies;
+        Sharpe-only, no Sortino/composite). ``min_composite`` is
+        ignored for stocks (default 49.0 wouldn't match); callers
+        should pass ``min_composite=0`` or rely on ``min_sharpe``.
+      - ``asset_class=''`` or ``'all'`` → legacy ``v_nexus_strategy_pool``
+        (back-compat).
 
-    Sortino is the headline ranking metric (penalizes only downside vol,
-    which is the risk that actually hurts PnL for long-biased crypto).
-    Sharpe is the tiebreaker. If the upstream table only has a Sharpe
-    column (no Sortino yet), the function falls back to Sharpe-only and
-    the returned dict carries ``note: 'sharpe_only'`` so the calling
-    agent can flag the data quality.
+    Sortino is the headline ranking metric for crypto (penalizes only
+    downside vol, which is the risk that actually hurts PnL for
+    long-biased crypto). For stocks Sortino is NULL so the reader
+    falls back to Sharpe-first ordering automatically.
 
     Args:
         regime: Optional regime label filter (blank = all regimes).
-        min_composite: Minimum composite score (default 49.0, the WF gate).
-        min_sharpe: Minimum in-sample Sharpe ratio (legacy filter).
-        min_sortino: Minimum in-sample Sortino ratio (NEW, default 0.0 =
-            no filter; e.g. 0.5 to require Sortino > 0.5).
-        ticker: Filter by ticker (e.g. 'BTC').
+        min_composite: Minimum composite score (default 49.0, the WF gate;
+            ignored for stocks).
+        min_sharpe: Minimum in-sample Sharpe ratio.
+        min_sortino: Minimum in-sample Sortino ratio (default 0.0 = no
+            filter; e.g. 0.5 to require Sortino > 0.5).
+        ticker: Filter by ticker (e.g. 'BTC'). For stocks pass empty
+            string or a category like 'TECH'.
         limit: Max strategies to return.
+        asset_class: ``"crypto"`` (default), ``"stocks"``, or ``""``.
 
     Returns:
         dict with ``strategies`` list (each row carries ``sortino`` as
         the headline + ``sharpe`` as tiebreaker + ``sortino_headline``
-        flag + ``note`` if fallback was used), ``count``, and ``note``
-        if the result is Sharpe-only.
+        flag + ``note`` if fallback was used), ``count``, ``note``
+        if the result is Sharpe-only, and ``asset_class`` echoed back
+        for the agent's awareness.
     """
     try:
         reader = _get_reader()
@@ -183,15 +195,23 @@ def lakehouse_strategy_candidates(
         # ``as_of`` so the reader routes the query through the asof macro
         # and only returns rows whose as_of_timestamp <= current sim bar.
         sim_time = _get_sim_time()
+        # Stocks default to min_composite=0 since their composite_score
+        # is NULL; using the crypto default (49.0) would silently drop
+        # all rows. The caller can still override.
+        if asset_class == "stocks" and min_composite == 49.0:
+            effective_min_composite = 0.0
+        else:
+            effective_min_composite = min_composite
         strategies = reader.get_strategy_pool(
             regime_label=regime,
-            min_composite=min_composite,
+            min_composite=effective_min_composite,
             min_sharpe=min_sharpe,
             min_sortino=min_sortino,
             ticker=ticker,
             sort_by="sortino",
             limit=limit,
             as_of=sim_time,
+            asset_class=asset_class,
         )
 
         # Detect whether the upstream table is Sharpe-only (no Sortino
@@ -220,6 +240,7 @@ def lakehouse_strategy_candidates(
             "strategies": strategies,
             "count": len(strategies),
             "as_of_sim_time": sim_time,
+            "asset_class": asset_class,
         }
         if sharpe_only:
             result["note"] = "sharpe_only"

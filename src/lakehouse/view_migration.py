@@ -111,15 +111,39 @@ NEXUS_CURATED_VIEW_DDL: list[list[str]] = [
 # the active sim-time and pass it through here.
 #
 # Each macro accepts a single ``as_of`` argument (ISO datetime string)
-# and filters rows whose ``as_of_timestamp`` column is NULL or <= the
-# bound. We use DuckDB's ``to_timestamp(?)`` so callers can pass plain
-# ISO strings; ``try_cast`` falls back if the column is text-typed.
+# and filters rows whose ``created_at`` column is NULL or <= the bound.
+#
+# Asset-class split (2026-06-26): the strategy pool is split into
+# ``v_nexus_strategy_pool_crypto`` (BTC/ETH/SOL universe, source_repo
+# excluding quant-research-mas) and ``v_nexus_strategy_pool_stocks``
+# (TradFi universe — reads from the ``strategies`` base table where
+# ``type='stocks'``). Both expose the same column shape so the lakehouse
+# reader can iterate them uniformly. Both have their own asof macro.
+#
+# Note: the legacy ``v_nexus_strategy_pool_asof`` macro and the unsuffixed
+# ``v_nexus_strategy_pool`` view are kept for backward compatibility but
+# new agent code MUST read from ``*_crypto`` / ``*_stocks`` explicitly.
 NEXUS_ASOF_MACRO_DDL: list[str] = [
+    # Legacy unsuffixed — kept for callers that haven't migrated yet.
+    # Filters by date_end (the legacy view doesn't expose created_at).
     """
-    CREATE OR REPLACE MACRO v_nexus_strategy_pool_asof(as_of) AS
+    CREATE OR REPLACE MACRO v_nexus_strategy_pool_asof(as_of) AS TABLE
     SELECT * FROM v_nexus_strategy_pool
-    WHERE (as_of_timestamp IS NULL OR as_of_timestamp <= to_timestamp(as_of))
+    WHERE date_end IS NULL OR TRY_CAST(date_end AS DATE) <= TRY_CAST(as_of AS DATE)
     """,
+    # Crypto asof (uses created_at synthesized from date_start in the view)
+    """
+    CREATE OR REPLACE MACRO v_nexus_strategy_pool_crypto_asof(as_of) AS TABLE
+    SELECT * FROM v_nexus_strategy_pool_crypto
+    WHERE created_at IS NULL OR created_at <= CAST(as_of AS TIMESTAMP)
+    """,
+    # Stocks asof (uses created_at from the strategies base table)
+    """
+    CREATE OR REPLACE MACRO v_nexus_strategy_pool_stocks_asof(as_of) AS TABLE
+    SELECT * FROM v_nexus_strategy_pool_stocks
+    WHERE created_at IS NULL OR created_at <= CAST(as_of AS TIMESTAMP)
+    """,
+    # Other curated views
     """
     CREATE OR REPLACE MACRO v_nexus_regime_strategy_map_asof(as_of) AS
     SELECT * FROM v_nexus_regime_strategy_map
@@ -143,11 +167,167 @@ NEXUS_ASOF_MACRO_DDL: list[str] = [
 ]
 NEXUS_ASOF_MACRO_NAMES: tuple[str, ...] = (
     "v_nexus_strategy_pool_asof",
+    "v_nexus_strategy_pool_crypto_asof",
+    "v_nexus_strategy_pool_stocks_asof",
     "v_nexus_regime_strategy_map_asof",
     "v_nexus_catalyst_digest_asof",
     "v_nexus_failures_asof",
     "v_nexus_experience_asof",
 )
+
+# Asset-class split views (2026-06-26). Crypto filters the existing
+# v_nexus_strategy_pool (BTC/ETH/SOL universe); stocks reads from the
+# ``strategies`` base table where ``type='stocks'`` and projects a
+# compatible column shape. Both views add a ``created_at`` column for
+# the asof macros above.
+#
+# IMPORTANT: there are TWO places these views need to live — the local
+# ``quant.duckdb`` file (used for testing / standalone scripts) AND the
+# DuckLake Postgres catalog (the production read path; the
+# ``ducklake_redirect`` shim in ``src.lakehouse.reader`` routes nexus-trade
+# reads through DuckLake). The migration installs to BOTH targets so the
+# split is consistent regardless of which DB the caller hits.
+NEXUS_ASSET_CLASS_VIEWS: list[str] = [
+    # Crypto — same shape as the legacy pool but with created_at synthesized
+    # Uses source_repo and ticker to identify crypto rows (the local
+    # quant.duckdb populates these from backtest_results_v2; DuckLake's
+    # pool is built from strategies where non-stock rows are crypto).
+    """
+    CREATE OR REPLACE VIEW v_nexus_strategy_pool_crypto AS
+    SELECT *, TRY_CAST(date_start AS TIMESTAMP) AS created_at
+    FROM v_nexus_strategy_pool
+    WHERE COALESCE(source_repo,'') != 'quant-research-mas'
+       OR ticker IN ('BTC','ETH','SOL','BTC/USDT','ETH/USDT','SOL/USDT','MULTI','ALL')
+    """,
+    # Stocks — projection from strategies base table
+    """
+    CREATE OR REPLACE VIEW v_nexus_strategy_pool_stocks AS
+    SELECT
+        name            AS strategy_name,
+        'STOCKS'        AS ticker,
+        NULL::DOUBLE    AS composite_score,
+        backtest_sharpe AS sharpe,
+        NULL::DOUBLE    AS sortino,
+        NULL::DOUBLE    AS calmar,
+        NULL::DOUBLE    AS profit_factor,
+        backtest_max_dd AS max_drawdown,
+        NULL::DOUBLE    AS win_rate,
+        NULL::INTEGER   AS num_trades,
+        backtest_return AS total_return,
+        NULL::DOUBLE    AS avg_win,
+        NULL::DOUBLE    AS avg_loss,
+        NULL::BOOLEAN   AS wf_pass,
+        NULL::DOUBLE    AS wf_test_sharpe,
+        NULL::DOUBLE    AS avg_test_sharpe,
+        NULL::INTEGER   AS n_windows,
+        NULL::DOUBLE    AS wf_consistency,
+        COALESCE(strategy_category, type) AS archetype,
+        NULL::VARCHAR   AS regime_label,
+        NULL::VARCHAR   AS regime_best_tag,
+        NULL::DOUBLE    AS regime_best_sharpe,
+        params_json     AS params_json,
+        NULL::VARCHAR   AS source_code,
+        status          AS status,
+        NULL::VARCHAR   AS fail_reasons,
+        source_repo     AS source_repo,
+        COALESCE(is_canonical, false) AS is_best_version,
+        NULL::INTEGER   AS indicator_count,
+        NULL::BOOLEAN   AS has_regime_filter,
+        NULL::BOOLEAN   AS has_volume,
+        NULL::BOOLEAN   AS has_atr_stop,
+        NULL::VARCHAR   AS entry_logic_type,
+        NULL::VARCHAR   AS exit_logic_type,
+        NULL::VARCHAR   AS specialist_regime,
+        quality_score   AS robustness_score,
+        NULL::DOUBLE    AS holding_period_avg,
+        NULL::DOUBLE    AS exposure_pct,
+        NULL::DATE      AS date_start,
+        NULL::DATE      AS date_end,
+        created_at      AS created_at
+    FROM strategies
+    WHERE type = 'stocks'
+    """,
+]
+NEXUS_ASSET_CLASS_VIEW_NAMES: tuple[str, ...] = (
+    "v_nexus_strategy_pool_crypto",
+    "v_nexus_strategy_pool_stocks",
+)
+
+
+# DuckLake-specific variant of the asset-class views. The DuckLake
+# catalog uses a different source table layout (the ``strategies`` base
+# table is the canonical strategy registry there; ``backtest_results_v2``
+# has per-backtest rows with an ``asset_class`` column but is not used by
+# the existing ``v_nexus_strategy_pool`` view). We use ``type != 'stocks'``
+# as the crypto filter (the only non-stock strategies in DuckLake are
+# crypto), and the explicit ``strategies WHERE type='stocks'`` for stocks.
+NEXUS_ASSET_CLASS_VIEWS_DUCKLAKE: list[str] = [
+    """
+    CREATE OR REPLACE VIEW v_nexus_strategy_pool_crypto AS
+    SELECT *, created_at
+    FROM v_nexus_strategy_pool
+    WHERE COALESCE(type,'') != 'stocks'
+    """,
+    """
+    CREATE OR REPLACE VIEW v_nexus_strategy_pool_stocks AS
+    SELECT
+        name            AS strategy_name,
+        'STOCKS'        AS ticker,
+        CAST(NULL AS DOUBLE) AS composite_score,
+        backtest_sharpe AS sharpe,
+        CAST(NULL AS DOUBLE) AS sortino,
+        CAST(NULL AS DOUBLE) AS calmar,
+        CAST(NULL AS DOUBLE) AS profit_factor,
+        backtest_max_dd AS max_drawdown,
+        CAST(NULL AS DOUBLE) AS win_rate,
+        CAST(NULL AS INTEGER) AS num_trades,
+        backtest_return AS total_return,
+        CAST(NULL AS DOUBLE) AS avg_win,
+        CAST(NULL AS DOUBLE) AS avg_loss,
+        CAST(NULL AS BOOLEAN) AS wf_pass,
+        CAST(NULL AS DOUBLE) AS wf_test_sharpe,
+        CAST(NULL AS DOUBLE) AS avg_test_sharpe,
+        CAST(NULL AS INTEGER) AS n_windows,
+        CAST(NULL AS DOUBLE) AS wf_consistency,
+        COALESCE(strategy_category, type) AS archetype,
+        CAST(NULL AS VARCHAR) AS regime_label,
+        CAST(NULL AS VARCHAR) AS regime_best_tag,
+        CAST(NULL AS DOUBLE) AS regime_best_sharpe,
+        params_json     AS params_json,
+        CAST(NULL AS VARCHAR) AS source_code,
+        status          AS status,
+        CAST(NULL AS VARCHAR) AS fail_reasons,
+        source_repo     AS source_repo,
+        COALESCE(is_canonical, CAST('f' AS BOOLEAN)) AS is_best_version,
+        CAST(NULL AS INTEGER) AS indicator_count,
+        CAST(NULL AS BOOLEAN) AS has_regime_filter,
+        CAST(NULL AS BOOLEAN) AS has_volume,
+        CAST(NULL AS BOOLEAN) AS has_atr_stop,
+        CAST(NULL AS VARCHAR) AS entry_logic_type,
+        CAST(NULL AS VARCHAR) AS exit_logic_type,
+        CAST(NULL AS VARCHAR) AS specialist_regime,
+        quality_score   AS robustness_score,
+        CAST(NULL AS DOUBLE) AS holding_period_avg,
+        CAST(NULL AS DOUBLE) AS exposure_pct,
+        CAST(NULL AS DATE) AS date_start,
+        CAST(NULL AS DATE) AS date_end,
+        created_at      AS created_at
+    FROM strategies
+    WHERE type = 'stocks'
+    """,
+]
+NEXUS_ASSET_CLASS_VIEWS_DUCKLAKE_MACROS: list[str] = [
+    """
+    CREATE OR REPLACE MACRO v_nexus_strategy_pool_crypto_asof(as_of) AS TABLE
+    SELECT * FROM v_nexus_strategy_pool_crypto
+    WHERE created_at IS NULL OR created_at <= CAST(as_of AS TIMESTAMP)
+    """,
+    """
+    CREATE OR REPLACE MACRO v_nexus_strategy_pool_stocks_asof(as_of) AS TABLE
+    SELECT * FROM v_nexus_strategy_pool_stocks
+    WHERE created_at IS NULL OR created_at <= CAST(as_of AS TIMESTAMP)
+    """,
+]
 
 
 def ensure_views(con: Any, view_ddl: list[list[str]] | None = None) -> int:
@@ -250,8 +430,13 @@ def ensure_asof_macros(con: Any, macro_ddl: list[str] | None = None) -> int:
 def ensure_views_in_quantdb(db_path: str | None = None) -> int:
     """Open quant.duckdb in write mode and ensure views + asof macros exist.
 
-    Convenience function for the CLI / one-shot migration. Returns the
-    total number of views+macros created/replaced.
+    Also installs the asset-class views + asof macros in the DuckLake
+    catalog (the production read path used by nexus-trade via the
+    ``ducklake_redirect`` shim). DuckLake install is best-effort — if
+    the catalog isn't reachable, we log a warning and continue.
+
+    Returns the total number of views+macros created/replaced across
+    both targets (local file + DuckLake).
 
     Parameters
     ----------
@@ -272,29 +457,140 @@ def ensure_views_in_quantdb(db_path: str | None = None) -> int:
                 "~/development/agentic-quant-os/data/quant.duckdb",
             )
         )
+    n_total = 0
+    # --- Local file ---
     if not os.path.exists(db_path):
         logger.warning(
-            "quant.duckdb not found at %s — skipping view migration",
+            "quant.duckdb not found at %s — skipping local view migration",
             db_path,
+        )
+    else:
+        try:
+            import duckdb
+            con = duckdb.connect(db_path, read_only=False)
+            try:
+                n_total += ensure_views(con)
+                n_total += ensure_asset_class_views(con)
+                n_total += ensure_asof_macros(con)
+            finally:
+                con.close()
+        except Exception as exc:
+            logger.error(
+                "Local view migration failed for %s: %s", db_path, exc,
+            )
+
+    # --- DuckLake (best-effort) ---
+    n_total += ensure_views_in_ducklake()
+    return n_total
+
+
+def ensure_views_in_ducklake() -> int:
+    """Install asset-class views + asof macros in the DuckLake catalog.
+
+    The DuckLake catalog lives at ``ducklake:postgres:...`` (defaults to
+    localhost:5433) and stores the canonical production lakehouse. The
+    ``ducklake_redirect`` shim in ``src.lakehouse.reader`` makes
+    nexus-trade read from DuckLake transparently, so the views MUST exist
+    there too. Best-effort: returns 0 and logs a warning if the catalog
+    isn't reachable.
+
+    Returns
+    -------
+    int
+        Number of views+macros created/replaced in DuckLake (0 if unreachable).
+    """
+    catalog = os.environ.get(
+        "DUCKLAKE_CATALOG",
+        "ducklake:postgres:dbname=ducklake_catalog host=localhost port=5433 user=postgres",
+    )
+    data_path = os.environ.get(
+        "DUCKLAKE_DATA_PATH",
+        "/home/Zev/development/agentic-quant-os/data/ducklake_data",
+    )
+    try:
+        import duckdb
+        con = duckdb.connect(catalog)
+        con.execute(
+            f"ATTACH '{catalog}' AS ducklake (DATA_PATH '{data_path}')"
+        )
+    except Exception as exc:
+        logger.warning(
+            "DuckLake catalog unreachable (%s) — skipping DuckLake view migration",
+            str(exc)[:120],
         )
         return 0
     try:
-        import duckdb
-        con = duckdb.connect(db_path, read_only=False)
+        n = 0
+        for stmt in NEXUS_ASSET_CLASS_VIEWS_DUCKLAKE:
+            try:
+                con.execute(stmt)
+                n += 1
+            except Exception as exc:
+                logger.debug(
+                    "DuckLake asset-class view skipped (%s): %s",
+                    stmt[:60], str(exc)[:120],
+                )
+        for stmt in NEXUS_ASSET_CLASS_VIEWS_DUCKLAKE_MACROS:
+            try:
+                con.execute(stmt)
+                n += 1
+            except Exception as exc:
+                logger.debug(
+                    "DuckLake asof macro skipped (%s): %s",
+                    stmt[:60], str(exc)[:120],
+                )
+        if n:
+            logger.info("DuckLake asset-class migration: %d views+macros ensured", n)
+        return n
+    finally:
+        con.close()
+
+
+def ensure_asset_class_views(
+    con: Any, view_ddl: list[str] | None = None,
+) -> int:
+    """Install the 2 asset-class split views.
+
+    Asset-class split (2026-06-26): the strategy pool is split into
+    ``v_nexus_strategy_pool_crypto`` (BTC/ETH/SOL universe) and
+    ``v_nexus_strategy_pool_stocks`` (TradFi universe). This function
+    installs both. Idempotent (``CREATE OR REPLACE VIEW``). Returns the
+    number of views successfully created.
+
+    Parameters
+    ----------
+    con : duckdb.DuckDBPyConnection
+        An open writable DuckDB connection.
+    view_ddl : list[str] | None
+        Optional override of the DDL list. Defaults to
+        :data:`NEXUS_ASSET_CLASS_VIEWS`.
+
+    Returns
+    -------
+    int
+        Number of views created or replaced.
+    """
+    ddl = view_ddl or NEXUS_ASSET_CLASS_VIEWS
+    created = 0
+    for stmt in ddl:
         try:
-            n = ensure_views(con) + ensure_asof_macros(con)
-            return n
-        finally:
-            con.close()
-    except Exception as exc:
-        logger.error(
-            "View migration failed for %s: %s", db_path, exc,
+            con.execute(stmt)
+            created += 1
+        except Exception as exc:
+            logger.debug(
+                "asset-class view creation skipped (%s): %s",
+                stmt[:60], exc,
+            )
+    if created:
+        logger.info(
+            "Nexus asset-class view migration: %d/%d views ensured",
+            created, len(ddl),
         )
-        return 0
+    return created
 
 
 def check_missing_views(db_path: str | None = None) -> list[str]:
-    """Check which of the 4 nexus views (and 5 asof macros) are missing
+    """Check which of the 4 nexus views (and asof macros) are missing
     from quant.duckdb.
 
     Returns a list of names that don't exist or error on read.
@@ -308,12 +604,16 @@ def check_missing_views(db_path: str | None = None) -> list[str]:
             )
         )
     if not os.path.exists(db_path):
-        return list((
-            "v_nexus_regime_strategy_map",
-            "v_nexus_catalyst_digest",
-            "v_nexus_failures",
-            "v_nexus_experience",
-        )) + list(NEXUS_ASOF_MACRO_NAMES)
+        return (
+            list((
+                "v_nexus_regime_strategy_map",
+                "v_nexus_catalyst_digest",
+                "v_nexus_failures",
+                "v_nexus_experience",
+            ))
+            + list(NEXUS_ASSET_CLASS_VIEW_NAMES)
+            + list(NEXUS_ASOF_MACRO_NAMES)
+        )
     try:
         import duckdb
         con = duckdb.connect(db_path, read_only=True)
@@ -324,10 +624,20 @@ def check_missing_views(db_path: str | None = None) -> list[str]:
                 "v_nexus_catalyst_digest",
                 "v_nexus_failures",
                 "v_nexus_experience",
-            ) + NEXUS_ASOF_MACRO_NAMES:
+            ) + NEXUS_ASSET_CLASS_VIEW_NAMES + NEXUS_ASOF_MACRO_NAMES:
                 try:
-                    con.execute(f"SELECT 1 FROM {vname}(CURRENT_TIMESTAMP) LIMIT 1").fetchone() if vname in NEXUS_ASOF_MACRO_NAMES else con.execute(f"SELECT 1 FROM {vname} LIMIT 1").fetchone()
-                except Exception:
+                    if vname in NEXUS_ASOF_MACRO_NAMES:
+                        con.execute(f"SELECT 1 FROM {vname}(CURRENT_TIMESTAMP) LIMIT 1").fetchone()
+                    else:
+                        con.execute(f"SELECT 1 FROM {vname} LIMIT 1").fetchone()
+                except Exception as exc:
+                    # DEBUG: log the underlying exception so we can diagnose
+                    # catalog mismatches. Remove once confirmed stable.
+                    import logging
+                    logging.getLogger(__name__).debug(
+                        "check_missing_views: %s reported missing: %s",
+                        vname, str(exc)[:120],
+                    )
                     missing.append(vname)
             return missing
         finally:

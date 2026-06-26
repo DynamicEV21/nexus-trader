@@ -1028,11 +1028,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("strategy_name", help="e.g. meta_cmo_alma_atr_wf_v1")
     parser.add_argument("--symbol", default="BTC")
     parser.add_argument("--exchange", default="binance")
-    parser.add_argument("--profile", default="loose", choices=["default", "strict", "loose"],
+    parser.add_argument("--profile", default="loose", choices=["default", "strict", "loose", "stocks"],
                         help="Gate profile. Default is 'loose' (Tristan 2026-06-25: "
                              "we are testing, want more strategies to pass through; will "
                              "tighten over time). 'default' = crypto-trend-calibrated. "
-                             "'strict' = brief's original thresholds.")
+                             "'strict' = brief's original thresholds. "
+                             "'stocks' = equity-tuned (MAS daily-bar strategies; "
+                             "no sortino required, higher Sharpe floor, win_rate=0.40).")
     parser.add_argument("--no-persist", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
@@ -1071,6 +1073,23 @@ def main(argv: list[str] | None = None) -> int:
         profile.num_trades = 30
         profile.calmar = 0.5
         profile.recovery_factor = 1.0
+        profile.sqn = 1.0
+        profile.omega_ratio = 1.2
+    elif args.profile == "stocks":
+        # 2026-06-26: equity-tuned profile for MAS daily-bar strategies.
+        # Stocks typically have lower vol (so higher Sharpe floor at
+        # 1.0 vs 0.5) and more trades per year (so num_trades >= 30),
+        # and their stored metrics in the lakehouse don't include
+        # Sortino (the v_nexus_strategy_pool_stocks projection has NULL
+        # sortino). We relax sortino to 0 (any) and tighten the other
+        # gates. The walk-forward OOS ratios stay the same as loose.
+        profile.sortino = 0.0  # Sortino is NULL for stocks — don't filter on it
+        profile.profit_factor = 1.2  # equity strategies usually have higher PF
+        profile.max_drawdown = 0.25  # 25% — daily equity MDD is tighter
+        profile.win_rate = 0.40  # equity day-trend often 40-45%
+        profile.num_trades = 30  # daily bars -> more trades/year
+        profile.calmar = 0.5
+        profile.recovery_factor = 1.0  # equities recover faster
         profile.sqn = 1.0
         profile.omega_ratio = 1.2
 

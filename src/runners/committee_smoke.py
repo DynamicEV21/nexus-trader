@@ -102,6 +102,8 @@ def main() -> int:
     parser.add_argument("--no-lakehouse", action="store_true", help="Disable lakehouse tools")
     parser.add_argument("--no-memory-bridge", action="store_true", help="Skip memory bridge")
     parser.add_argument("--quiet", action="store_true", help="Reduce log output")
+    parser.add_argument("--asset-class", default="crypto", choices=["crypto", "stocks"],
+                        help="Asset class for lakehouse routing (default: crypto)")
     args = parser.parse_args()
 
     log_level = logging.WARNING if args.quiet else logging.INFO
@@ -159,6 +161,7 @@ def main() -> int:
         "enable_notifications": False,
         "use_memory_bridge": not args.no_memory_bridge,
         "lakehouse_enabled": not args.no_lakehouse,
+        "asset_class": args.asset_class,
         # Raise default agent call cap so committee can complete all 5 runs.
         # History: 6 → 10 (2026-06-23 Tristan); 10 → 30 (2026-06-23 — see
         # non-blockers-fix-report: bull/bear cases w/ full toolset can run >10 LLM calls

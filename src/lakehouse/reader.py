@@ -233,12 +233,25 @@ class NexusLakehouseReader:
         sort_by: str = "sortino",
         limit: int = 20,
         as_of: str = "",
+        asset_class: str = "crypto",
     ) -> list[dict[str, Any]]:
-        """Validated crypto strategies from v_nexus_strategy_pool.
+        """Validated strategies from ``v_nexus_strategy_pool`` (or its asset-class split).
 
-        The view reads from ``backtest_results_v2`` and is pre-filtered to
+        The default view reads from ``backtest_results_v2`` and is pre-filtered to
         crypto-relevant tickers (BTC, ETH, SOL, ALL, MULTI) with
         ``composite_score >= 49`` and ``status IN ('winner', 'tested')``.
+
+        Asset-class routing (2026-06-26):
+          - ``asset_class='crypto'`` (default) → reads from
+            ``v_nexus_strategy_pool_crypto`` / ``..._asof``.
+          - ``asset_class='stocks'`` → reads from
+            ``v_nexus_strategy_pool_stocks`` / ``..._asof``.
+          - ``asset_class=''`` (empty) or ``'all'`` → legacy
+            ``v_nexus_strategy_pool`` (back-compat; returns mixed).
+
+        Stock pool columns differ from crypto (no ``sortino``,
+        ``composite_score``, ``regime_label``, etc.); the ranking and
+        threshold filters degrade gracefully to NULL-safe comparisons.
 
         Default ranking is by Sortino (penalizes only downside volatility —
         better metric than Sharpe for asymmetric crypto payoffs where upside
@@ -251,10 +264,14 @@ class NexusLakehouseReader:
             min_sharpe: Minimum in-sample Sharpe ratio.
             min_sortino: Minimum in-sample Sortino ratio (NEW, default 0 = no
                 filter; e.g. 0.5 = only return strategies with Sortino > 0.5).
-            ticker: Filter by ticker (e.g. 'BTC').
+            ticker: Filter by ticker (e.g. 'BTC'). For stocks this is a
+                category (e.g. 'STOCKS', 'TECH', 'SPY'); pass an empty
+                string to get all stocks.
             sort_by: Ranking key — ``"sortino"`` (default), ``"sharpe"``, or
                 ``"composite"``.
             limit: Max results.
+            as_of: ISO timestamp for anti-leakage cutoff (B2).
+            asset_class: ``"crypto"`` (default), ``"stocks"``, or ``""`` / ``"all"``.
         """
         clauses: list[str] = []
         params: list[Any] = []
@@ -275,23 +292,44 @@ class NexusLakehouseReader:
             params.extend([regime_label, regime_label])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
+        # Asset-class routing (2026-06-26). Done before ORDER BY so the
+        # ranking can degrade gracefully (stocks have NULL sortino).
+        ac = (asset_class or "").lower()
+
         # Map sort_by to a SQL ORDER BY clause. Sortino DESC NULLS LAST is
         # the canonical ranking for crypto strategies: penalizes only downside
         # volatility, which is the risk that matters to a long-biased committee.
+        # For stocks the Sortino/composite columns are NULL, so we fall back
+        # to sharpe-first ordering.
         order_by_map: dict[str, str] = {
             "sortino": "sortino DESC NULLS LAST, sharpe DESC NULLS LAST, composite_score DESC NULLS LAST",
             "sharpe": "sharpe DESC NULLS LAST, sortino DESC NULLS LAST, composite_score DESC NULLS LAST",
             "composite": "composite_score DESC NULLS LAST, sortino DESC NULLS LAST",
         }
         order_by = order_by_map.get(sort_by, order_by_map["sortino"])
+        # Stocks ranking override: prefer sharpe-first when sortino is NULL
+        if ac == "stocks" and sort_by == "sortino":
+            order_by = "sharpe DESC NULLS LAST"
         params.append(limit)
 
+        # Asset-class view + macro selection (2026-06-26). We map the
+        # caller's ``asset_class`` to the right split view. If the split
+        # view isn't installed yet (migration hasn't run) we fall back
+        # to the legacy v_nexus_strategy_pool.
+        if ac in ("crypto", "stocks"):
+            base_view = f"v_nexus_strategy_pool_{ac}"
+            asof_macro = f"v_nexus_strategy_pool_{ac}_asof"
+        else:
+            # Legacy / mixed pool — back-compat with callers that haven't
+            # been updated yet. The legacy asof macro may not exist; the
+            # try/except below handles that gracefully.
+            base_view = "v_nexus_strategy_pool"
+            asof_macro = "v_nexus_strategy_pool_asof"
+
         # B2 anti-leakage (2026-06-25): when ``as_of`` is set, route the
-        # query through the ``v_nexus_strategy_pool_asof`` macro so we
-        # only see rows whose as_of_timestamp <= the bound. The macro's
-        # own WHERE applies the cutoff; we then layer the filter params
-        # on top. Falls back to the plain view if the macro isn't
-        # installed (e.g., the migration hasn't run yet).
+        # query through the asset-class asof macro so we only see rows
+        # whose created_at <= the bound. Falls back to the plain view
+        # if the macro isn't installed (e.g., the migration hasn't run).
         if as_of:
             try:
                 # The macro already has its own WHERE; we need to add
@@ -299,14 +337,14 @@ class NexusLakehouseReader:
                 asof_clause = where.replace("WHERE ", "", 1) if where else ""
                 outer_where = f"WHERE {asof_clause}" if asof_clause else ""
                 return self._query(
-                    f"SELECT * FROM v_nexus_strategy_pool_asof(?) {outer_where} "
+                    f"SELECT * FROM {asof_macro}(?) {outer_where} "
                     f"ORDER BY {order_by} LIMIT ?",
                     [as_of] + params,
                 )
             except Exception as exc:
-                logger.debug("v_nexus_strategy_pool_asof failed (%s); falling back", exc)
+                logger.debug("%s failed (%s); falling back", asof_macro, exc)
         return self._query(
-            f"SELECT * FROM v_nexus_strategy_pool {where} "
+            f"SELECT * FROM {base_view} {where} "
             f"ORDER BY {order_by} LIMIT ?", params
         )
 
