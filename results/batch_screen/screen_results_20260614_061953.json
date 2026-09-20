@@ -1,0 +1,114 @@
+[
+  {
+    "strategy": "connors_rsi_starc_v2",
+    "symbol": "BTC",
+    "status": "success",
+    "num_entries": 75,
+    "num_exits": 50,
+    "backtest_name": "sf_connors_rsi_starc_v2_BTC",
+    "total_return_pct": -91.8,
+    "max_drawdown_pct": 91.98,
+    "sharpe": -1.606,
+    "cagr": -50.26,
+    "volatility": 33.91,
+    "romad": -0.546
+  },
+  {
+    "strategy": "connors_rsi_starc_v2",
+    "symbol": "ETH",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "connors_rsi_starc_v2",
+    "symbol": "SOL",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "cci_oversold_scalp",
+    "symbol": "BTC",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "cci_oversold_scalp",
+    "symbol": "ETH",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "cci_oversold_scalp",
+    "symbol": "SOL",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "accel_band_ppo_multi",
+    "symbol": "BTC",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "accel_band_ppo_multi",
+    "symbol": "ETH",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "accel_band_ppo_multi",
+    "symbol": "SOL",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "breakout_starc_vhf_volume_v2",
+    "symbol": "BTC",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "breakout_starc_vhf_volume_v2",
+    "symbol": "ETH",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "breakout_starc_vhf_volume_v2",
+    "symbol": "SOL",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "cmf_bbwp_squeeze_breakout",
+    "symbol": "BTC",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "cmf_bbwp_squeeze_breakout",
+    "symbol": "ETH",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  },
+  {
+    "strategy": "cmf_bbwp_squeeze_breakout",
+    "symbol": "SOL",
+    "status": "error",
+    "error": "[Errno 32] Broken pipe",
+    "traceback": "date_payload)\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/backtesting/backtesting_broker.py\", line 453, in _update_datetime\n    self.data_source._update_datetime(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/data_source_backtesting.py\", line 374, in _update_datetime\n    print_progress_bar(\n  File \"/home/Zev/development/trading-bots/lumibot/lumibot/tools/helpers.py\", line 650, in print_progress_bar\n    file.flush()\nBrokenPipeError: [Errno 32] Broken pipe\n"
+  }
+]

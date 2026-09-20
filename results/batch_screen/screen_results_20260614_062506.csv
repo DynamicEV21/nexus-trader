@@ -1,0 +1,3 @@
+strategy,symbol,status,num_entries,num_exits,backtest_name,total_return_pct,max_drawdown_pct,sharpe,cagr,volatility,romad
+accel_band_ppo_multi,BTC,success,34,22,sf_accel_band_ppo_multi_BTC,76.23,12.56,1.236,32.88,22.41,2.618
+cci_oversold_scalp,BTC,success,69,69,sf_cci_oversold_scalp_BTC,-18.37,40.11,-0.482,-9.68,30.87,-0.241

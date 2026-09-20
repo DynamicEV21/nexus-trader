@@ -1,0 +1,6 @@
+strategy,symbol,window_index,status,train_start,train_end,test_start,test_end,num_entries,num_exits,profitable,budget,total_return_pct,max_drawdown_pct,sharpe,cagr,volatility,romad
+meta_vwap_kc_wc_wfm,BTC,0,success,2021-06-01,2022-06-01,2022-06-06,2022-12-01,3,3,True,10000,6.8,11.9,0.336,14.54,30.77,1.222
+meta_vwap_kc_wc_wfm,BTC,1,success,2021-06-01,2022-12-01,2022-12-06,2023-06-01,4,4,True,10000,85.89,6.05,7.218,264.74,35.96,43.759
+meta_vwap_kc_wc_wfm,BTC,2,success,2021-06-01,2023-06-01,2023-06-06,2023-12-01,3,3,True,10000,53.5,4.42,5.282,142.12,25.92,32.119
+meta_vwap_kc_wc_wfm,BTC,3,success,2021-06-01,2023-12-01,2023-12-06,2024-06-01,3,4,True,10000,63.58,10.17,5.008,177.69,34.43,17.473
+meta_vwap_kc_wc_wfm,BTC,4,success,2021-06-01,2024-06-01,2024-06-06,2024-12-01,4,3,True,10000,62.32,7.17,5.28,171.7,31.69,23.943

@@ -1,0 +1,10 @@
+strategy,symbol,status,error,traceback
+connors_rsi_starc_v2,BTC,error,'DataFrame' object has no attribute 'asset',"^^^^^^^^^^^^^^^
+  File ""/home/Zev/development/trading-bots/lumibot/lumibot/data_sources/pandas_data.py"", line 65, in _get_new_pandas_data_key
+    if isinstance(data.asset, tuple):
+                  ^^^^^^^^^^
+  File ""/home/Zev/development/trading-bots/lumibot/.venv/lib/python3.12/site-packages/pandas/core/generic.py"", line 6206, in __getattr__
+    return object.__getattribute__(self, name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'DataFrame' object has no attribute 'asset'
+"

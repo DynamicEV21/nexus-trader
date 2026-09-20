@@ -1,0 +1,2 @@
+strategy,symbol,n_profitable,n_windows,avg_sharpe,avg_return_pct,verdict,reason
+meta_vwap_kc_wc_wfm,BTC,5,5,4.625,54.42,PASS,profitable in >=3/5 windows AND avg OOS Sharpe > 0

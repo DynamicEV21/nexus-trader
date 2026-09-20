@@ -1,0 +1,77 @@
+{
+  ".openclaw/workspace-state.json": {
+    "mtime": 1780314930.0049274,
+    "ast_hash": "84210f71d7df32c6a6b6e86be81f0997",
+    "semantic_hash": "84210f71d7df32c6a6b6e86be81f0997"
+  },
+  "src/__init__.py": {
+    "mtime": 1780345187.2615023,
+    "ast_hash": "586e87e724a3215388a5a87f6fb929eb",
+    "semantic_hash": "586e87e724a3215388a5a87f6fb929eb"
+  },
+  "src/memory/__init__.py": {
+    "mtime": 1780345187.2615023,
+    "ast_hash": "7d6fae5cc474c24e0cd5b0b71eba10f1",
+    "semantic_hash": "7d6fae5cc474c24e0cd5b0b71eba10f1"
+  },
+  "src/memory/bridge.py": {
+    "mtime": 1780345187.2615023,
+    "ast_hash": "027a295a76378ed804fd8c48613c1e55",
+    "semantic_hash": "027a295a76378ed804fd8c48613c1e55"
+  },
+  "src/memory/nexus_vector_memory.py": {
+    "mtime": 1780517420.0287168,
+    "ast_hash": "8c201d3867633f1d811d28298419fb47",
+    "semantic_hash": "8c201d3867633f1d811d28298419fb47"
+  },
+  "src/strategies/__init__.py": {
+    "mtime": 1780345187.2615023,
+    "ast_hash": "16e23c24b71c42245f0fedea64e6cb7c",
+    "semantic_hash": "16e23c24b71c42245f0fedea64e6cb7c"
+  },
+  "src/strategies/nexus_committee.py": {
+    "mtime": 1780517436.456169,
+    "ast_hash": "f7c2ad4ea4ee647a1961f97bba1baef2",
+    "semantic_hash": "f7c2ad4ea4ee647a1961f97bba1baef2"
+  },
+  "src/tools/__init__.py": {
+    "mtime": 1780314963.7508962,
+    "ast_hash": "0b60e747f2738ecb8c4ba8ec6d7edf48",
+    "semantic_hash": "0b60e747f2738ecb8c4ba8ec6d7edf48"
+  },
+  "src/tools/regime_tool.py": {
+    "mtime": 1780315209.7185707,
+    "ast_hash": "71b5ab8d4b746cdc0a09dacb12b7b13c",
+    "semantic_hash": "71b5ab8d4b746cdc0a09dacb12b7b13c"
+  },
+  "src/tools/signal_dashboard_tool.py": {
+    "mtime": 1780315366.5386395,
+    "ast_hash": "f61ab222afcd32109a9d8568fb5249f2",
+    "semantic_hash": "f61ab222afcd32109a9d8568fb5249f2"
+  },
+  "src/tools/trade_memory_tool.py": {
+    "mtime": 1780517430.2927434,
+    "ast_hash": "e2f07d7f752a5ce109670991b9d5a95f",
+    "semantic_hash": "e2f07d7f752a5ce109670991b9d5a95f"
+  },
+  "AGENTS.md": {
+    "mtime": 1780349131.6356184,
+    "ast_hash": "1864b996a8f9c4f8f284052f22dd82b1",
+    "semantic_hash": "1864b996a8f9c4f8f284052f22dd82b1"
+  },
+  "docs/AUDIT_REPORT.md": {
+    "mtime": 1780344227.5753968,
+    "ast_hash": "81b90947cf3460164763f74f8f307a02",
+    "semantic_hash": "81b90947cf3460164763f74f8f307a02"
+  },
+  "docs/INTEGRATION_MAP.md": {
+    "mtime": 1780345261.5078132,
+    "ast_hash": "b8b7b12dd251455cb2fd05d4082525b1",
+    "semantic_hash": "b8b7b12dd251455cb2fd05d4082525b1"
+  },
+  "docs/NEXUS_TRADER_ROADMAP.md": {
+    "mtime": 1780345261.5078132,
+    "ast_hash": "8f296eb4cdbef0f68e7b148e46bcb72a",
+    "semantic_hash": "8f296eb4cdbef0f68e7b148e46bcb72a"
+  }
+}

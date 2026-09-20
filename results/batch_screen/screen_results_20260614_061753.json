@@ -1,0 +1,44 @@
+[
+  {
+    "strategy": "connors_rsi_starc_v2",
+    "symbol": "BTC",
+    "status": "success",
+    "num_entries": 75,
+    "num_exits": 50,
+    "backtest_name": "sf_connors_rsi_starc_v2_BTC",
+    "total_return_pct": -91.8,
+    "max_drawdown_pct": 91.98,
+    "sharpe": -1.606,
+    "cagr": -50.26,
+    "volatility": 33.91,
+    "romad": -0.546
+  },
+  {
+    "strategy": "connors_rsi_starc_v2",
+    "symbol": "ETH",
+    "status": "success",
+    "num_entries": 85,
+    "num_exits": 51,
+    "backtest_name": "sf_connors_rsi_starc_v2_ETH",
+    "total_return_pct": -96.46,
+    "max_drawdown_pct": 96.6,
+    "sharpe": -1.438,
+    "cagr": -60.67,
+    "volatility": 45.11,
+    "romad": -0.628
+  },
+  {
+    "strategy": "connors_rsi_starc_v2",
+    "symbol": "SOL",
+    "status": "success",
+    "num_entries": 88,
+    "num_exits": 53,
+    "backtest_name": "sf_connors_rsi_starc_v2_SOL",
+    "total_return_pct": -99.24,
+    "max_drawdown_pct": 99.28,
+    "sharpe": -1.166,
+    "cagr": -74.42,
+    "volatility": 67.42,
+    "romad": -0.75
+  }
+]

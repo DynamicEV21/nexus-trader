@@ -1,0 +1,30 @@
+[
+  {
+    "strategy": "accel_band_ppo_multi",
+    "symbol": "BTC",
+    "status": "success",
+    "num_entries": 34,
+    "num_exits": 22,
+    "backtest_name": "sf_accel_band_ppo_multi_BTC",
+    "total_return_pct": 76.23,
+    "max_drawdown_pct": 12.56,
+    "sharpe": 1.236,
+    "cagr": 32.88,
+    "volatility": 22.41,
+    "romad": 2.618
+  },
+  {
+    "strategy": "cci_oversold_scalp",
+    "symbol": "BTC",
+    "status": "success",
+    "num_entries": 69,
+    "num_exits": 69,
+    "backtest_name": "sf_cci_oversold_scalp_BTC",
+    "total_return_pct": -18.37,
+    "max_drawdown_pct": 40.11,
+    "sharpe": -0.482,
+    "cagr": -9.68,
+    "volatility": 30.87,
+    "romad": -0.241
+  }
+]

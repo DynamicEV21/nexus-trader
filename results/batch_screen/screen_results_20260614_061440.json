@@ -1,0 +1,10 @@
+[
+  {
+    "strategy": "connors_rsi_starc_v2",
+    "symbol": "BTC",
+    "status": "success",
+    "num_entries": 75,
+    "num_exits": 50,
+    "backtest_name": "sf_connors_rsi_starc_v2_BTC"
+  }
+]

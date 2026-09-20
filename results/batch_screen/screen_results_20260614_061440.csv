@@ -1,0 +1,2 @@
+strategy,symbol,status,num_entries,num_exits,backtest_name
+connors_rsi_starc_v2,BTC,success,75,50,sf_connors_rsi_starc_v2_BTC

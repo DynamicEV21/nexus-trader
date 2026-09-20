@@ -1,0 +1,16 @@
+strategy,symbol,status,num_entries,num_exits,backtest_name,total_return_pct,max_drawdown_pct,sharpe,cagr,volatility,romad
+connors_rsi_starc_v2,BTC,success,75,50,sf_connors_rsi_starc_v2_BTC,-91.8,91.98,-1.606,-50.26,33.91,-0.546
+connors_rsi_starc_v2,ETH,success,85,51,sf_connors_rsi_starc_v2_ETH,-96.46,96.6,-1.438,-60.67,45.11,-0.628
+connors_rsi_starc_v2,SOL,success,88,53,sf_connors_rsi_starc_v2_SOL,-99.24,99.28,-1.166,-74.42,67.42,-0.75
+cci_oversold_scalp,BTC,success,69,69,sf_cci_oversold_scalp_BTC,8.92,43.45,-0.066,2.41,27.28,0.056
+cci_oversold_scalp,ETH,success,68,68,sf_cci_oversold_scalp_ETH,15.44,49.55,-0.003,4.09,37.98,0.083
+cci_oversold_scalp,SOL,success,79,79,sf_cci_oversold_scalp_SOL,-3.39,58.96,-0.092,-0.96,56.01,-0.016
+accel_band_ppo_multi,BTC,success,34,22,sf_accel_band_ppo_multi_BTC,565.67,12.56,2.386,69.78,27.48,5.556
+accel_band_ppo_multi,ETH,success,29,23,sf_accel_band_ppo_multi_ETH,801.56,16.99,2.378,84.79,33.88,4.99
+accel_band_ppo_multi,SOL,success,31,21,sf_accel_band_ppo_multi_SOL,1545.4,25.08,2.318,118.59,49.34,4.728
+breakout_starc_vhf_volume_v2,BTC,success,20,20,sf_breakout_starc_vhf_volume_v2_BTC,445.0,12.96,2.306,60.56,24.44,4.674
+breakout_starc_vhf_volume_v2,ETH,success,21,21,sf_breakout_starc_vhf_volume_v2_ETH,367.46,16.99,1.627,53.82,30.5,3.167
+breakout_starc_vhf_volume_v2,SOL,success,24,24,sf_breakout_starc_vhf_volume_v2_SOL,5129.61,57.38,3.083,201.91,64.12,3.518
+cmf_bbwp_squeeze_breakout,BTC,success,37,37,sf_cmf_bbwp_squeeze_breakout_BTC,496.48,9.85,2.402,64.66,25.17,6.561
+cmf_bbwp_squeeze_breakout,ETH,success,30,30,sf_cmf_bbwp_squeeze_breakout_ETH,583.09,19.19,2.264,71.01,29.51,3.7
+cmf_bbwp_squeeze_breakout,SOL,success,24,24,sf_cmf_bbwp_squeeze_breakout_SOL,1436.36,14.41,2.784,114.45,39.59,7.942

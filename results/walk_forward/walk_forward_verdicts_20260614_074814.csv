@@ -1,0 +1,10 @@
+strategy,symbol,n_profitable,n_windows,avg_sharpe,avg_return_pct,verdict,reason
+accel_band_ppo_multi,BTC,5,5,3.057,33.39,PASS,profitable in >=3/5 windows AND avg OOS Sharpe > 0
+accel_band_ppo_multi,ETH,4,5,3.021,42.65,PASS,profitable in >=3/5 windows AND avg OOS Sharpe > 0
+accel_band_ppo_multi,SOL,4,5,1.987,40.6,PASS,profitable in >=3/5 windows AND avg OOS Sharpe > 0
+cmf_bbwp_squeeze_breakout,BTC,5,5,2.963,34.49,PASS,profitable in >=3/5 windows AND avg OOS Sharpe > 0
+cmf_bbwp_squeeze_breakout,ETH,5,5,2.751,37.33,PASS,profitable in >=3/5 windows AND avg OOS Sharpe > 0
+cmf_bbwp_squeeze_breakout,SOL,4,5,5.07,80.44,PASS,profitable in >=3/5 windows AND avg OOS Sharpe > 0
+breakout_starc_vhf_volume_v2,BTC,5,5,3.022,33.52,PASS,profitable in >=3/5 windows AND avg OOS Sharpe > 0
+breakout_starc_vhf_volume_v2,ETH,5,5,2.258,31.89,PASS,profitable in >=3/5 windows AND avg OOS Sharpe > 0
+breakout_starc_vhf_volume_v2,SOL,4,5,5.994,88.49,PASS,profitable in >=3/5 windows AND avg OOS Sharpe > 0

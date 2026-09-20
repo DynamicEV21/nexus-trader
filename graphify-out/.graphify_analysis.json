@@ -1,0 +1,328 @@
+{
+  "communities": {
+    "0": [
+      "memory_nexus_vector_memory_nexusvectormemory",
+      "memory_nexus_vector_memory_nexusvectormemory_batch_embed",
+      "memory_nexus_vector_memory_nexusvectormemory_batch_store_decisions",
+      "memory_nexus_vector_memory_nexusvectormemory_build_context_prompt",
+      "memory_nexus_vector_memory_nexusvectormemory_build_decision_dna",
+      "memory_nexus_vector_memory_nexusvectormemory_ensure_db",
+      "memory_nexus_vector_memory_nexusvectormemory_ensure_model",
+      "memory_nexus_vector_memory_nexusvectormemory_get_embedding",
+      "memory_nexus_vector_memory_nexusvectormemory_get_recent_lessons",
+      "memory_nexus_vector_memory_nexusvectormemory_get_stats",
+      "memory_nexus_vector_memory_nexusvectormemory_init",
+      "memory_nexus_vector_memory_nexusvectormemory_search_lessons",
+      "memory_nexus_vector_memory_nexusvectormemory_search_similar_decisions",
+      "memory_nexus_vector_memory_nexusvectormemory_store_decision",
+      "memory_nexus_vector_memory_nexusvectormemory_store_lesson",
+      "memory_nexus_vector_memory_rationale_110",
+      "memory_nexus_vector_memory_rationale_146",
+      "memory_nexus_vector_memory_rationale_191",
+      "memory_nexus_vector_memory_rationale_217",
+      "memory_nexus_vector_memory_rationale_226",
+      "memory_nexus_vector_memory_rationale_246",
+      "memory_nexus_vector_memory_rationale_272",
+      "memory_nexus_vector_memory_rationale_301",
+      "memory_nexus_vector_memory_rationale_379",
+      "memory_nexus_vector_memory_rationale_506",
+      "memory_nexus_vector_memory_rationale_568",
+      "memory_nexus_vector_memory_rationale_643",
+      "memory_nexus_vector_memory_rationale_700",
+      "memory_nexus_vector_memory_rationale_747",
+      "memory_nexus_vector_memory_rationale_813",
+      "src_memory_nexus_vector_memory_py_any"
+    ],
+    "1": [
+      "agents_gemini_3_flash",
+      "agents_glm_5_turbo",
+      "agents_nexus_committee",
+      "src_strategies_nexus_committee_py_any",
+      "strategies_nexus_committee_nexuscommitteestrategy_bear_researcher_prompt",
+      "strategies_nexus_committee_nexuscommitteestrategy_build_context",
+      "strategies_nexus_committee_nexuscommitteestrategy_bull_researcher_prompt",
+      "strategies_nexus_committee_nexuscommitteestrategy_evidence_researcher_prompt",
+      "strategies_nexus_committee_nexuscommitteestrategy_initialize",
+      "strategies_nexus_committee_nexuscommitteestrategy_on_trading_iteration",
+      "strategies_nexus_committee_nexuscommitteestrategy_portfolio_manager_prompt",
+      "strategies_nexus_committee_nexuscommitteestrategy_register_tools",
+      "strategies_nexus_committee_nexuscommitteestrategy_run_memory_bridge",
+      "strategies_nexus_committee_rationale_106",
+      "strategies_nexus_committee_rationale_170",
+      "strategies_nexus_committee_rationale_194",
+      "strategies_nexus_committee_rationale_213",
+      "strategies_nexus_committee_rationale_305",
+      "strategies_nexus_committee_rationale_77",
+      "strategy"
+    ],
+    "2": [
+      "memory_bridge_memorybridge",
+      "memory_bridge_memorybridge_deduplicate",
+      "memory_bridge_memorybridge_read_jsonl",
+      "memory_bridge_memorybridge_sync_all",
+      "memory_bridge_memorybridge_sync_decisions",
+      "memory_bridge_memorybridge_sync_lessons",
+      "memory_bridge_memorybridge_sync_memories",
+      "memory_bridge_memorybridge_sync_theses",
+      "memory_bridge_rationale_127",
+      "memory_bridge_rationale_162",
+      "memory_bridge_rationale_220",
+      "memory_bridge_rationale_273",
+      "memory_bridge_rationale_340",
+      "memory_bridge_rationale_393",
+      "memory_bridge_rationale_51",
+      "memory_bridge_rationale_87",
+      "src_memory_bridge_py_any"
+    ],
+    "3": [
+      "concept_crabquant",
+      "concept_deepseekv4",
+      "concept_gemini3fp",
+      "concept_glm5",
+      "concept_lumibot",
+      "execution_roadmap_roadmap",
+      "lumibot_research_lumibot",
+      "model_guide_model_guide",
+      "prd_prd",
+      "readme_nexus_trader",
+      "research_agent_systems",
+      "research_backtesting_backtesting",
+      "research_financial_data",
+      "tool_calling_benchmarks"
+    ],
+    "4": [
+      "memory_nexus_vector_memory_get_nexus_memory",
+      "memory_nexus_vector_memory_rationale_844",
+      "src_tools_trade_memory_tool_py_any",
+      "tools_trade_memory_tool",
+      "tools_trade_memory_tool_get_memory_stats_tool",
+      "tools_trade_memory_tool_query_trade_memory_tool",
+      "tools_trade_memory_tool_rationale_1",
+      "tools_trade_memory_tool_rationale_122",
+      "tools_trade_memory_tool_rationale_187",
+      "tools_trade_memory_tool_rationale_251",
+      "tools_trade_memory_tool_rationale_41",
+      "tools_trade_memory_tool_remember_decision_tool",
+      "tools_trade_memory_tool_remember_lesson_tool"
+    ],
+    "5": [
+      "lancemodel",
+      "memory_bridge",
+      "memory_bridge_memorybridge_init",
+      "memory_bridge_memorybridge_nexus_memory",
+      "memory_bridge_rationale_1",
+      "memory_bridge_rationale_77",
+      "memory_nexus_vector_memory_nexusdecisionrecord",
+      "memory_nexus_vector_memory_nexuslessonrecord",
+      "memory_nexus_vector_memory_rationale_1",
+      "memory_nexus_vector_memory_rationale_61",
+      "memory_nexus_vector_memory_rationale_79",
+      "nexusvectormemory"
+    ],
+    "6": [
+      "agents_duckdb_time_wall",
+      "agents_nexus_trader",
+      "agents_replay_cache",
+      "audit_report_memory_system",
+      "integration_agentic_quant_os",
+      "integration_crabquant",
+      "integration_genome_db",
+      "integration_quant_loop_testnet",
+      "integration_strat_depot",
+      "lumibot_lumibot",
+      "roadmap_guard_pipeline"
+    ],
+    "7": [
+      "src_tools_signal_dashboard_tool_py_any",
+      "tools_signal_dashboard_tool",
+      "tools_signal_dashboard_tool_compute_atr",
+      "tools_signal_dashboard_tool_compute_macd",
+      "tools_signal_dashboard_tool_compute_rsi",
+      "tools_signal_dashboard_tool_rationale_1",
+      "tools_signal_dashboard_tool_rationale_296",
+      "tools_signal_dashboard_tool_rationale_312",
+      "tools_signal_dashboard_tool_rationale_329",
+      "tools_signal_dashboard_tool_rationale_34",
+      "tools_signal_dashboard_tool_rationale_343"
+    ],
+    "8": [
+      "src_tools_regime_tool_py_any",
+      "strategies_nexus_committee",
+      "strategies_nexus_committee_rationale_1",
+      "tools_regime_tool",
+      "tools_regime_tool_detect_regime_tool",
+      "tools_regime_tool_rationale_1",
+      "tools_regime_tool_rationale_34"
+    ],
+    "9": [
+      "bootstrap_bootstrap",
+      "identity_identity",
+      "soul_soul",
+      "user_user"
+    ],
+    "10": [
+      "openclaw_workspace_state",
+      "openclaw_workspace_state_bootstrapseededat",
+      "openclaw_workspace_state_version"
+    ],
+    "11": [
+      "brainstorm_chatlog",
+      "concept_lancedb"
+    ],
+    "12": [
+      "memory_init",
+      "memory_init_rationale_1"
+    ],
+    "13": [
+      "src_init",
+      "src_init_rationale_1"
+    ],
+    "14": [
+      "strategies_init",
+      "strategies_init_rationale_1"
+    ],
+    "15": [
+      "tools_init",
+      "tools_init_rationale_1"
+    ],
+    "16": [
+      "concept_genome_db"
+    ],
+    "17": [
+      "tools_tools"
+    ]
+  },
+  "cohesion": {
+    "0": 0.11827956989247312,
+    "1": 0.1368421052631579,
+    "2": 0.22058823529411764,
+    "3": 0.16483516483516483,
+    "4": 0.24358974358974358,
+    "5": 0.18181818181818182,
+    "6": 0.2,
+    "7": 0.18181818181818182,
+    "8": 0.2857142857142857,
+    "9": 0.5,
+    "10": 0.6666666666666666,
+    "11": 1.0,
+    "12": 1.0,
+    "13": 1.0,
+    "14": 1.0,
+    "15": 1.0,
+    "16": 1.0,
+    "17": 1.0
+  },
+  "gods": [
+    {
+      "id": "memory_nexus_vector_memory_nexusvectormemory",
+      "label": "NexusVectorMemory",
+      "degree": 20
+    },
+    {
+      "id": "memory_bridge_memorybridge",
+      "label": "MemoryBridge",
+      "degree": 16
+    },
+    {
+      "id": "agents_nexus_committee",
+      "label": "Nexus Committee Strategy",
+      "degree": 15
+    },
+    {
+      "id": "memory_nexus_vector_memory_get_nexus_memory",
+      "label": "get_nexus_memory()",
+      "degree": 10
+    },
+    {
+      "id": "nexusvectormemory",
+      "label": "NexusVectorMemory",
+      "degree": 8
+    },
+    {
+      "id": "src_memory_nexus_vector_memory_py_any",
+      "label": "Any",
+      "degree": 8
+    },
+    {
+      "id": "agents_nexus_trader",
+      "label": "Nexus Trader",
+      "degree": 7
+    },
+    {
+      "id": "tools_trade_memory_tool_get_memory_stats_tool",
+      "label": "get_memory_stats_tool()",
+      "degree": 6
+    },
+    {
+      "id": "concept_lumibot",
+      "label": "LumiBot v4.5.25",
+      "degree": 6
+    },
+    {
+      "id": "memory_nexus_vector_memory_nexusdecisionrecord",
+      "label": "NexusDecisionRecord",
+      "degree": 5
+    }
+  ],
+  "surprises": [
+    {
+      "source": "Multi-agent investment committee with persistent vector memory.      Parameters",
+      "target": "Nexus Committee Strategy",
+      "source_files": [
+        "src/strategies/nexus_committee.py",
+        "AGENTS.md"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "rationale_for",
+      "why": "crosses file types (code \u2194 doc); connects across different repos/directories; peripheral node `Multi-agent investment committee with persistent vector memory.      Parameters` unexpectedly reaches hub `Nexus Committee Strategy`"
+    },
+    {
+      "source": "Nexus Trader",
+      "target": "Strategy Genome DB",
+      "source_files": [
+        "AGENTS.md",
+        "docs/INTEGRATION_MAP.md"
+      ],
+      "confidence": "INFERRED",
+      "relation": "shares_data_with",
+      "why": "inferred connection - not explicitly stated in source; connects across different repos/directories; peripheral node `Strategy Genome DB` unexpectedly reaches hub `Nexus Trader`"
+    },
+    {
+      "source": "Financial Data Research",
+      "target": "LumiBot v4.5.25",
+      "source_files": [
+        "docs/research_financial_data.md",
+        "README.md"
+      ],
+      "confidence": "INFERRED",
+      "relation": "references",
+      "why": "inferred connection - not explicitly stated in source; connects across different repos/directories; peripheral node `Financial Data Research` unexpectedly reaches hub `LumiBot v4.5.25`"
+    },
+    {
+      "source": "Any",
+      "target": "MemoryBridge",
+      "source_files": [
+        "src/strategies/nexus_committee.py",
+        "src/memory/bridge.py"
+      ],
+      "confidence": "INFERRED",
+      "relation": "uses",
+      "why": "inferred connection - not explicitly stated in source; bridges separate communities; peripheral node `Any` unexpectedly reaches hub `MemoryBridge`"
+    },
+    {
+      "source": "Nexus Trader",
+      "target": "agentic-quant-os",
+      "source_files": [
+        "AGENTS.md",
+        "docs/INTEGRATION_MAP.md"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "conceptually_related_to",
+      "why": "connects across different repos/directories; peripheral node `agentic-quant-os` unexpectedly reaches hub `Nexus Trader`"
+    }
+  ],
+  "tokens": {
+    "input": 33557,
+    "output": 3782
+  }
+}

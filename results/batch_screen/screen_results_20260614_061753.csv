@@ -1,0 +1,4 @@
+strategy,symbol,status,num_entries,num_exits,backtest_name,total_return_pct,max_drawdown_pct,sharpe,cagr,volatility,romad
+connors_rsi_starc_v2,BTC,success,75,50,sf_connors_rsi_starc_v2_BTC,-91.8,91.98,-1.606,-50.26,33.91,-0.546
+connors_rsi_starc_v2,ETH,success,85,51,sf_connors_rsi_starc_v2_ETH,-96.46,96.6,-1.438,-60.67,45.11,-0.628
+connors_rsi_starc_v2,SOL,success,88,53,sf_connors_rsi_starc_v2_SOL,-99.24,99.28,-1.166,-74.42,67.42,-0.75
